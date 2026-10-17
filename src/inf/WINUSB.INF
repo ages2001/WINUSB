@@ -1,0 +1,144 @@
+; WINUSB.INF - WINDRV 1.0 WINUSB for Windows 95, 98 and ME: Universal Serial Bus controllers
+; UHCI (USB 1.1), OHCI (USB 1.1), EHCI (USB 2.0), xHCI (USB 3.x) and USB4 host controllers,
+; USB hubs and the USB devices without a class driver of WINDRV. WINUSB.VXD drives the
+; controllers and enumerates the devices; the other classes have their own INF files:
+;   WINKBD.INF  keyboards (USB and PS/2)          WINMOU.INF  mice (USB and PS/2)
+;   WINUSBH.INF tablets, touch screens, other HID  WINUSBA.INF USB Audio 1.0 / 2.0, MIDI
+;   WINUSBV.INF USB Video Class cameras             WINUSBD.INF USB disks (BOT, UAS)
+;   WINUSBS.INF Thunderbolt / USB4 host interfaces, Intel LPSS I2C (System devices)
+
+[Version]
+Signature="$CHICAGO$"
+Class=USB
+ClassGUID={36FC9E60-C465-11CF-8056-444553540000}
+Provider=%Provider%
+
+[ClassInstall]
+AddReg=Class.AddReg
+CopyFiles=Class.Copy
+
+[Class.AddReg]
+HKR,,,,"%ClassName%"
+HKR,,Installer,,"WINDRVCI.DLL,ClassInstall"
+HKR,,Icon,,"2"
+HKR,,NoInstallClass,,1
+
+[Class.Copy]
+WINDRVCI.DLL
+
+[DestinationDirs]
+DefaultDestDir=11
+Class.Copy=11
+WINUSB.CopyPdr=12
+WINUSB.CopyInf=17
+
+[SourceDisksNames]
+1=%DiskName%,,0
+
+[SourceDisksFiles]
+WINUSB.VXD=1
+WIN4G.VXD=1
+WINUSB.PDR=1
+WINDRVCI.DLL=1
+WINMOUSE.DRV=1
+WINSOUND.DRV=1
+WINWHEEL.EXE=1
+USBTREE.EXE=1
+WINCAM.EXE=1
+WINMIX.EXE=1
+WINUSBD.INF=1
+WINUSBH.INF=1
+WINUSBA.INF=1
+WINUSBV.INF=1
+WINUSBS.INF=1
+WINKBD.INF=1
+WINMOU.INF=1
+
+[Manufacturer]
+%Provider%=WINDRV
+
+; Windows 95 matches only the 4-digit class code (PCI\CC_0C03): WINUSB.VXD writes the precise
+; name of the controller when it starts it
+[WINDRV]
+%UHCI.Desc%=WINUSB.HC,PCI\CC_0C0300
+%OHCI.Desc%=WINUSB.HC,PCI\CC_0C0310
+%EHCI.Desc%=WINUSB.HC,PCI\CC_0C0320
+%xHCI.Desc%=WINUSB.HC,PCI\CC_0C0330
+%USB4.Desc%=WINUSB.HC,PCI\CC_0C0340
+%USB.Desc%=WINUSB.HC,PCI\CC_0C03
+%Hub30.Desc%=WINUSB.Dev,WINUSB\HUB30
+%Hub20.Desc%=WINUSB.Dev,WINUSB\HUB20
+%Hub11.Desc%=WINUSB.Dev,WINUSB\HUB11
+%Hub.Desc%=WINUSB.Dev,WINUSB\HUB
+%Other.Desc%=WINUSB.Dev,WINUSB\DEVICE
+
+; ---- host controllers: WINUSB.VXD is the DevLoader and the enumerator of the USB devices ----
+[WINUSB.HC]
+CopyFiles=WINUSB.CopyVxd,WINUSB.CopyPdr,WINUSB.CopyInf,Class.Copy
+AddReg=WINUSB.HC.AddReg
+UpdateInis=WINUSB.Inis
+
+[WINUSB.HC.AddReg]
+HKR,,DevLoader,,WINUSB.VXD
+HKR,,Options,,""
+HKR,,DriverDesc,,"%Provider% WINUSB 1.0"
+
+[WINUSB.CopyVxd]
+WINUSB.VXD
+WIN4G.VXD
+WINMOUSE.DRV
+WINSOUND.DRV
+WINWHEEL.EXE
+USBTREE.EXE
+WINCAM.EXE
+WINMIX.EXE
+
+[WINUSB.CopyPdr]
+WINUSB.PDR
+
+[WINUSB.CopyInf]
+WINUSBD.INF
+WINUSBH.INF
+WINUSBA.INF
+WINUSBV.INF
+WINUSBS.INF
+WINKBD.INF
+WINMOU.INF
+
+; the mouse driver with wheel, back / forward buttons and autoscroll replaces MOUSE.DRV,
+; WINWHEEL scrolls the programs that do not know the wheel, WINSOUND.DRV plays through USB
+; Audio devices; WIN4G.VXD moves PCI resources above 4G below 4G before the PCI bus is
+; enumerated (the ones of the WINDRV devices; /ALL4G for all); WINUSB.VXD loaded at the start
+; takes the USB host controllers before the I/O Supervisor looks at the BIOS drives (a USB
+; boot disk gets 32-bit access)
+[WINUSB.Inis]
+system.ini,386Enh,,"device=win4g.vxd"
+system.ini,386Enh,,"device=winusb.vxd"
+system.ini,boot,"mouse.drv=*","mouse.drv=winmouse.drv"
+system.ini,drivers,,"wave=winsound.drv"
+system.ini,drivers,,"midi=winsound.drv"
+win.ini,windows,,"load=winwheel.exe"
+
+; ---- hubs and other devices: served by WINUSB.VXD (the enumerator) itself, which registers a
+; removable driver for them so that unplugging never asks for a restart ----
+[WINUSB.Dev]
+AddReg=WINUSB.Dev.AddReg
+
+[WINUSB.Dev.AddReg]
+HKR,,DevLoader,,WINUSB.VXD
+
+[Strings]
+Provider="WINDRV"
+ClassName="Universal Serial Bus controllers"
+DiskName="WINDRV WINUSB 1.0 disk"
+UHCI.Desc="WINUSB USB 1.1 UHCI Universal Host Controller"
+OHCI.Desc="WINUSB USB 1.1 OHCI Open Host Controller"
+EHCI.Desc="WINUSB USB 2.0 EHCI Enhanced Host Controller"
+xHCI.Desc="WINUSB USB 3.x xHCI eXtensible Host Controller"
+USB4.Desc="WINUSB USB4 Host Router"
+USB.Desc="WINUSB USB Host Controller (UHCI / OHCI / EHCI / xHCI)"
+Hub30.Desc="WINUSB USB 3.x SuperSpeed Hub"
+Hub20.Desc="WINUSB USB 2.0 High-Speed Hub"
+Hub11.Desc="WINUSB USB 1.1 Full-Speed Hub"
+Hub.Desc="WINUSB USB Hub"
+Other.Desc="WINUSB USB Device (no WINDRV class driver)"

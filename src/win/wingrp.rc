@@ -1,0 +1,7 @@
+/* wingrp.rc - icons of the WINDRV Program Manager items (index = order) */
+1 ICON usb.ico
+2 ICON speaker.ico
+3 ICON disk.ico
+4 ICON bench.ico
+5 ICON note.ico
+6 ICON camera.ico

@@ -1,0 +1,12 @@
+; OEMSETUP.INF - WINUSB mouse driver for Windows 3.0 / 3.1 / WfW 3.11
+; Windows Setup -> Mouse -> "Other mouse (requires disk from OEM manufacturer)"
+
+[data]
+Version = "3.1"
+
+[disks]
+1 =. ,"WINUSB driver disk",disk1
+
+[pointing.device]
+;profile  = mouse driver,    Mouse description,                       VMD
+winmouse  = 1:winmouse.drv, "WINDRV USB + PS/2 mouse with wheel",     x:*vmd

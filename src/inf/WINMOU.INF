@@ -1,0 +1,109 @@
+; WINMOU.INF - WINDRV 1.0 WINUSB mice for Windows 95, 98 and ME
+; The PS/2 mouse of the 8042 and the USB mice WINUSB enumerates, both driven by WINUSB.VXD:
+; wheel, tilt, buttons 4 and 5 (back / forward) and the middle button reach WINMOUSE.DRV,
+; which replaces MOUSE.DRV; WINWHEEL.EXE scrolls programs that do not know the wheel and
+; does the autoscroll of the wheel button. The PS/2 mouse is switched to IntelliMouse
+; Explorer mode (5 buttons, wheel) when it supports it; Synaptics and ELAN touchpads (ACPI ids
+; SYN..., ETD..., with the compatible id PNP0F13) to their own protocols: two-finger scrolling,
+; taps, clickpads, also over SMBus. Windows' own PS/2 mouse driver (VMOUSE with MSMOUSE.VXD)
+; is not used for it any more.
+
+[Version]
+Signature="$CHICAGO$"
+Class=Mouse
+ClassGUID={4D36E96F-E325-11CE-BFC1-08002BE10318}
+Provider=%Provider%
+
+[ClassInstall]
+AddReg=MouClass.AddReg
+
+[MouClass.AddReg]
+HKR,,,,"%ClassName%"
+HKR,,Installer,,"SetupX.Dll, Mouse_ClassInstaller"
+HKR,,Icon,,"-2"
+
+[DestinationDirs]
+DefaultDestDir=11
+WINMOU.Copy=11
+
+[SourceDisksNames]
+1=%DiskName%,,0
+
+[SourceDisksFiles]
+WINUSB.VXD=1
+WINMOUSE.DRV=1
+WINWHEEL.EXE=1
+
+[Manufacturer]
+%Provider%=WINDRV
+
+[WINDRV]
+%PS2.Desc%=WINMOU.PS2,*PNP0F13
+%PS2.Desc%=WINMOU.PS2,*PNP0F03
+%PS2.Desc%=WINMOU.PS2,*PNP0F0B
+%PS2.Desc%=WINMOU.PS2,*PNP0F0E
+%PS2.Desc%=WINMOU.PS2,*PNP0F12
+%PS2.Desc%=WINMOU.PS2,*PNP0F19
+%PS2.Desc%=WINMOU.PS2,*PNP0F1C
+%USB.Desc%=WINMOU.USB,WINUSB\MOUSE
+
+; ---- PS/2 mouse: the 8042 auxiliary port (IRQ 12) ----
+[WINMOU.PS2]
+LogConfig=WINMOU.LogConfig
+DelReg=WINMOU.DelReg
+CopyFiles=WINMOU.Copy
+AddReg=WINMOU.PS2.AddReg
+UpdateInis=WINMOU.Inis
+
+[WINMOU.LogConfig]
+ConfigPriority=HARDWIRED
+IRQConfig=12
+
+[WINMOU.PS2.AddReg]
+HKR,,DevLoader,,WINUSB.VXD
+HKR,,Options,,""
+HKR,,DriverDesc,,"%Provider% WINUSB 1.0 PS/2 mouse"
+
+; ---- USB mice: served by WINUSB.VXD, the enumerator of the USB devices ----
+[WINMOU.USB]
+DelReg=WINMOU.DelReg
+CopyFiles=WINMOU.Copy
+AddReg=WINMOU.USB.AddReg
+UpdateInis=WINMOU.USB.Inis
+
+[WINMOU.USB.AddReg]
+HKR,,DevLoader,,WINUSB.VXD
+HKR,,DriverDesc,,"%Provider% WINUSB 1.0 USB mouse"
+
+; values of Windows' mouse drivers (VMOUSE)
+[WINMOU.DelReg]
+HKR,,MouseDriver
+HKR,,MouseType
+HKR,,ComInfo
+
+[WINMOU.Copy]
+WINUSB.VXD
+WINMOUSE.DRV
+WINWHEEL.EXE
+
+; WINMOUSE.DRV replaces MOUSE.DRV, VMOUSE stays without MSMOUSE.VXD, WINWHEEL runs at start
+[WINMOU.Inis]
+system.ini,boot,"mouse.drv=*","mouse.drv=winmouse.drv"
+system.ini,boot.description,"mouse.drv=*","mouse.drv=%Mouse.Desc%"
+system.ini,386Enh,"mouse=*","mouse=*vmouse"
+win.ini,windows,,"load=winwheel.exe"
+
+; a USB mouse leaves the PS/2 mouse devnode to its driver; when that is Windows' own (VMOUSE
+; with MSMOUSE.VXD), WINUSB.VXD takes the PS/2 mouse over once WINMOUSE.DRV starts
+[WINMOU.USB.Inis]
+system.ini,boot,"mouse.drv=*","mouse.drv=winmouse.drv"
+system.ini,boot.description,"mouse.drv=*","mouse.drv=%Mouse.Desc%"
+win.ini,windows,,"load=winwheel.exe"
+
+[Strings]
+Provider="WINDRV"
+ClassName="Mouse"
+DiskName="WINDRV WINUSB 1.0 disk"
+PS2.Desc="WINUSB PS/2 Mouse (IntelliMouse Explorer, 5 buttons)"
+USB.Desc="WINUSB USB HID Mouse"
+Mouse.Desc="WINDRV USB + PS/2 mouse with wheel"

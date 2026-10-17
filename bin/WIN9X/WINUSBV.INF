@@ -1,0 +1,50 @@
+; WINUSBV.INF - WINDRV 1.0 WINUSB for Windows 95, 98 and ME: Imaging devices
+; USB Video Class (UVC) cameras; WINCAM.EXE shows their picture.
+
+[Version]
+Signature="$CHICAGO$"
+Class=Image
+ClassGUID={6bdd1fc6-810f-11d0-bec7-08002be2092f}
+Provider=%Provider%
+
+[ClassInstall]
+AddReg=Class.AddReg
+CopyFiles=Class.Copy
+
+[Class.AddReg]
+HKR,,,,"%ClassName%"
+HKR,,Installer,,"WINDRVCI.DLL,ClassInstall"
+HKR,,Icon,,"4"
+HKR,,NoInstallClass,,1
+
+[Class.Copy]
+WINDRVCI.DLL
+
+[DestinationDirs]
+DefaultDestDir=11
+Class.Copy=11
+
+[SourceDisksNames]
+1=%DiskName%,,0
+
+[SourceDisksFiles]
+WINDRVCI.DLL=1
+
+[Manufacturer]
+%Provider%=WINDRV
+
+[WINDRV]
+%UVC.Desc%=WINUSB.Dev,WINUSB\VIDEO
+
+; served by WINUSB.VXD (the enumerator); its files came with the controller (WINUSB.INF)
+[WINUSB.Dev]
+AddReg=WINUSB.Dev.AddReg
+
+[WINUSB.Dev.AddReg]
+HKR,,DevLoader,,WINUSB.VXD
+
+[Strings]
+Provider="WINDRV"
+DiskName="WINDRV WINUSB 1.0 disk"
+ClassName="Imaging Devices"
+UVC.Desc="WINUSB USB Video Class (UVC) Camera"

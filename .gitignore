@@ -1,0 +1,12 @@
+obj/
+__pycache__/
+src/tests/host/*.o
+src/tests/host/*.obj
+src/tests/host/*.raw
+src/tests/host/*.ev
+src/tests/host/harness
+src/tests/host/*.EXE
+src/tests/host/hdacodec/hdacheck
+src/tests/host/hdacodec/hdadefs.c
+src/tests/host/hdacodec/hdapart.c
+src/tests/host/tp/*.bin

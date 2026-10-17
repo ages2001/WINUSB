@@ -1,0 +1,8 @@
+#include <windows.h>
+
+/* autoscroll: origin mark, then the scroll directions up, down, left, right */
+1 CURSOR asall.cur
+2 CURSOR asup.cur
+3 CURSOR asdown.cur
+4 CURSOR asleft.cur
+5 CURSOR asright.cur

@@ -1,0 +1,79 @@
+; WINKBD.INF - WINDRV 1.0 WINUSB keyboards for Windows 95, 98 and ME
+; The PS/2 keyboard of the 8042 and the USB keyboards WINUSB enumerates. WINUSB.VXD is the
+; driver of both devnodes: VKD keeps reading the PS/2 keyboard (KEYBOARD.DRV relies on it),
+; the USB keyboards type through it, and the LEDs of all keyboards follow the lock keys.
+
+[Version]
+Signature="$CHICAGO$"
+Class=Keyboard
+ClassGUID={4D36E96B-E325-11CE-BFC1-08002BE10318}
+Provider=%Provider%
+
+[ClassInstall]
+AddReg=KbdClass.AddReg
+
+[KbdClass.AddReg]
+HKR,,,,"%ClassName%"
+HKR,,Icon,,"-3"
+
+[DestinationDirs]
+DefaultDestDir=11
+WINKBD.CopyVxd=11
+
+[SourceDisksNames]
+1=%DiskName%,,0
+
+[SourceDisksFiles]
+WINUSB.VXD=1
+
+[Manufacturer]
+%Provider%=WINDRV
+
+[WINDRV]
+%PS2.Desc%=WINKBD.PS2,*PNP0303
+%PS2.Desc%=WINKBD.PS2,*PNP030B
+%PS2.Desc%=WINKBD.PS2,*PNP0301
+%PS2.Desc%=WINKBD.PS2,*PNP0302
+%PS2.Desc%=WINKBD.PS2,*PNP0300
+%PS2J.Desc%=WINKBD.PS2,*PNP0320
+%USB.Desc%=WINKBD.USB,WINUSB\KEYBOARD
+
+; ---- PS/2 keyboard: the 8042 keyboard port (I/O 60h and 64h, IRQ 1) ----
+[WINKBD.PS2]
+LogConfig=WINKBD.LogConfig
+CopyFiles=WINKBD.CopyVxd
+AddReg=WINKBD.PS2.AddReg
+UpdateInis=WINKBD.PS2.Inis
+
+[WINKBD.LogConfig]
+ConfigPriority=HARDWIRED
+IOConfig=60-60(ffff::)
+IOConfig=64-64(ffff::)
+IRQConfig=1
+
+[WINKBD.PS2.AddReg]
+HKR,,DevLoader,,WINUSB.VXD
+HKR,,DriverDesc,,"%Provider% WINUSB 1.0 PS/2 keyboard"
+
+[WINKBD.PS2.Inis]
+system.ini,boot.description,,"keyboard.typ=%PS2.Desc%"
+
+[WINKBD.CopyVxd]
+WINUSB.VXD
+
+; ---- USB keyboards: served by WINUSB.VXD, the enumerator of the USB devices ----
+[WINKBD.USB]
+CopyFiles=WINKBD.CopyVxd
+AddReg=WINKBD.USB.AddReg
+
+[WINKBD.USB.AddReg]
+HKR,,DevLoader,,WINUSB.VXD
+HKR,,DriverDesc,,"%Provider% WINUSB 1.0 USB keyboard"
+
+[Strings]
+Provider="WINDRV"
+ClassName="Keyboard"
+DiskName="WINDRV WINUSB 1.0 disk"
+PS2.Desc="WINUSB PS/2 Keyboard"
+PS2J.Desc="WINUSB PS/2 Keyboard (Japanese 106-Key)"
+USB.Desc="WINUSB USB HID Keyboard"

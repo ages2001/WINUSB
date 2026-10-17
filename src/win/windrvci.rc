@@ -1,0 +1,5 @@
+/* windrvci.rc - class icons by resource id: 2 USB, 3 HID, 4 imaging (Icon= of the INF files;
+   SETUPX of Windows 95 shows no class icon with id 1) */
+2 ICON usb.ico
+3 ICON hid.ico
+4 ICON camera.ico

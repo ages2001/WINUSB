@@ -1,0 +1,29 @@
+# DOS / Windows sources and documents use CRLF line endings
+*.c       text eol=crlf
+*.h       text eol=crlf
+*.asm     text eol=crlf
+*.inc     text eol=crlf
+*.rc      text eol=crlf
+*.inf     text eol=crlf
+*.INF     text eol=crlf
+*.md      text eol=crlf
+*.txt     text eol=crlf
+*.TXT     text eol=crlf
+# scripts run on the build host
+*.sh      text eol=lf
+*.py      text eol=lf
+# binaries
+bin/**    binary
+*.SYS     binary
+*.BIN     binary
+*.386     binary
+*.VXD     binary
+*.PDR     binary
+*.DRV     binary
+*.DLL     binary
+*.EXE     binary
+*.COM     binary
+*.RI      binary
+*.ico     binary
+*.cur     binary
+*.img     binary

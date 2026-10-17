@@ -1,0 +1,13 @@
+#include <windows.h>
+
+1 ICON camera.ico
+
+2 DIALOG 30, 30, 220, 50
+STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Folder for photos and videos"
+BEGIN
+    LTEXT "Folder:", -1, 6, 9, 40, 10
+    EDITTEXT 100, 48, 7, 166, 12, ES_AUTOHSCROLL
+    DEFPUSHBUTTON "OK", IDOK, 108, 28, 50, 14
+    PUSHBUTTON "Cancel", IDCANCEL, 164, 28, 50, 14
+END
