@@ -1,4 +1,4 @@
-# WINUSB 1.0 — USB driver for DOS and Windows 1.0–3.11 / 95 / 98 / ME
+# WINUSB 1.0 — USB driver for DOS, Windows 1.0x/2.xx/3.xx and Windows 95/98/ME
 
 WINUSB is a USB stack written from scratch for MS-DOS 5 / 6, Windows 1.0x, 2.x, 3.0, 3.1 /
 Windows for Workgroups 3.11 and Windows 95 / 98 / ME:
