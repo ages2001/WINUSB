@@ -1,4 +1,4 @@
-; WINKBD.INF - WINDRV 1.0 WINUSB keyboards for Windows 95, 98 and ME
+; WINKBD.INF - WINDRV 1.1 WINUSB keyboards for Windows 95, 98 and ME
 ; The PS/2 keyboard of the 8042 and the USB keyboards WINUSB enumerates. WINUSB.VXD is the
 ; driver of both devnodes: VKD keeps reading the PS/2 keyboard (KEYBOARD.DRV relies on it),
 ; the USB keyboards type through it, and the LEDs of all keyboards follow the lock keys.
@@ -53,7 +53,7 @@ IRQConfig=1
 
 [WINKBD.PS2.AddReg]
 HKR,,DevLoader,,WINUSB.VXD
-HKR,,DriverDesc,,"%Provider% WINUSB 1.0 PS/2 keyboard"
+HKR,,DriverDesc,,"%Provider% WINUSB 1.1 PS/2 keyboard"
 
 [WINKBD.PS2.Inis]
 system.ini,boot.description,,"keyboard.typ=%PS2.Desc%"
@@ -68,12 +68,12 @@ AddReg=WINKBD.USB.AddReg
 
 [WINKBD.USB.AddReg]
 HKR,,DevLoader,,WINUSB.VXD
-HKR,,DriverDesc,,"%Provider% WINUSB 1.0 USB keyboard"
+HKR,,DriverDesc,,"%Provider% WINUSB 1.1 USB keyboard"
 
 [Strings]
 Provider="WINDRV"
 ClassName="Keyboard"
-DiskName="WINDRV WINUSB 1.0 disk"
+DiskName="WINDRV WINUSB 1.1 disk"
 PS2.Desc="WINUSB PS/2 Keyboard"
 PS2J.Desc="WINUSB PS/2 Keyboard (Japanese 106-Key)"
 USB.Desc="WINUSB USB HID Keyboard"

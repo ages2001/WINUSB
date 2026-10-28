@@ -179,8 +179,8 @@ static int scsi(struct msclun *l, const u8 *cdb, int cdblen, u8 *buf, u32 len, i
 
 static u32 be32(const u8 *p) { return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3]; }
 
-/* CD/DVD drive (cdrom.c): one command, data in; a check condition keeps its sense for the
-   REQUEST SENSE that follows */
+/* CD/DVD drive (cdrom.c): one command, data in (or out with CDP_OUT); a check condition
+   keeps its sense for the REQUEST SENSE that follows */
 static int cd_packet(void *priv, const u8 *cdb, void *buf, u32 len, u32 ms)
 {
     struct msclun *l = priv;
@@ -192,7 +192,7 @@ static int cd_packet(void *priv, const u8 *cdb, void *buf, u32 len, u32 ms)
         return 0;
     }
     l->sense_held = 0;
-    r = scsi(l, cdb, n, buf, len, 1, ms);
+    r = scsi(l, cdb, n, buf, len & ~CDP_OUT, !(len & CDP_OUT), ms);
     if (r == SCSI_OK) return 0;
     if (r < 0 || r == 0x10) return -1;
     l->sense_held = 1;
@@ -281,9 +281,17 @@ static int msc_flush(struct blkdev *bd)
 {
     struct msclun *l = bd->priv;
     u8 cdb[10];
+    int r, tries;
     memset(cdb, 0, sizeof(cdb));
     cdb[0] = 0x35;
-    return scsi(l, cdb, 10, NULL, 0, 0, 20000) == SCSI_OK ? 0 : -1;
+    /* many sticks have no write cache and reject SYNCHRONIZE CACHE (ILLEGAL REQUEST): nothing
+       to write then; a pending UNIT ATTENTION is answered once more */
+    for (tries = 0; tries < 2; tries++) {
+        r = scsi(l, cdb, 10, NULL, 0, 0, 20000);
+        if (r == SCSI_OK || r == 5) return 0;
+        if (r != 6) break;
+    }
+    return -1;
 }
 
 static int msc_ready(struct blkdev *bd)

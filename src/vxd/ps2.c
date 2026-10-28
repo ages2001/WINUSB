@@ -29,6 +29,9 @@ static u8 pkt[4];
 static u8 pkt_pos, pkt_len = 3;
 static u32 pkt_ms;
 static u32 n_pkts, n_bad;
+static u8 stick;                    /* an IBM TrackPoint: the middle button scrolls */
+static u8 st_mid, st_moved;
+static int st_sy, st_sx;
 
 
 static void ps2_byte(u8 b);
@@ -86,6 +89,13 @@ static int ps2_program(void)
         if (aux_cmd(0xF4)) return -1;                   /* streaming on */
         return 5;
     }
+    /* the touchpad knocks may have left another device (ALPS, TrackPoint, an unknown pad)
+       in a special mode: back to its power-on state */
+    if (!(cb && (cb->opts2 & OPT2_NOTP)) && !aux_cmd(0xFF)) {
+        kbc_read(1, 1000);                              /* AAh */
+        kbc_read(1, 30);                                /* 00h */
+        aux_cmd(0xF5);
+    }
     /* IntelliMouse knock (wheel), then IntelliMouse Explorer knock (wheel, buttons 4 and 5) */
     set_rate(200); set_rate(100); set_rate(80);
     id = aux_id();
@@ -94,6 +104,12 @@ static int ps2_program(void)
         id = aux_id();
     }
     if (id != 3 && id != 4) id = 0;
+    /* IBM TrackPoint (ThinkPads): read secondary ID answers 01h */
+    stick = 0;
+    if (!id && !aux_cmd(0xE1)) {
+        int a = kbc_read(1, 30), b = kbc_read(1, 30);
+        if (a == 0x01 && b >= 0) stick = 1;
+    }
     set_rate(100);
     aux_cmd2(0xE8, 3);                                  /* 8 counts per mm */
     aux_cmd(0xE6);                                      /* scaling 1:1 */
@@ -131,6 +147,30 @@ static void ps2_packet(void)
         }
     }
     n_pkts++;
+    if (stick) {
+        /* TrackPoint: the stick scrolls while the middle button is held (both directions),
+           the middle button alone clicks */
+        if (btn & 4) {
+            if (!st_mid) {
+                st_mid = 1;
+                st_moved = 0;
+                st_sx = st_sy = 0;
+            }
+            if (dx || dy) st_moved = 1;
+            st_sy += dy;
+            st_sx += dx;
+            dz = st_sy / 8;
+            dw = st_sx / 8;
+            st_sy -= dz * 8;
+            st_sx -= dw * 8;
+            dz = -dz;
+            dx = dy = 0;
+            btn &= ~4;
+        } else if (st_mid) {
+            st_mid = 0;
+            if (!st_moved) vxd_ps2_mouse(0, 0, 0, 0, btn | 4);
+        }
+    }
     vxd_ps2_mouse(dx, dy, dz, dw, btn);
 }
 
@@ -167,7 +207,12 @@ u32 ps2_hwint(u32 h)
         ps2_byte(inb(KBC_DATA));
         n++;
     }
-    if (!n) return 1;
+    if (!n) {
+        /* an IRQ 12 left over from a byte read in the loop above while a keyboard byte waits:
+           a BIOS mouse handler further down the chain would read port 60h and take the key
+           (a lost Shift release), so it ends here; the keyboard byte has its own IRQ 1 */
+        if ((inb(KBC_STAT) & (ST_OBF | ST_AUX)) != ST_OBF) return 1;
+    }
     vpicd_phys_eoi(ps2_irqh);
     return 0;
 }
@@ -286,7 +331,7 @@ int ps2_start(int irq)
     vpicd_unmask(ps2_irqh);
     kprintf("ps2: %s%s on IRQ %d\n", id == 6 ? "touchpad on SMBus, " : id == 5 ? "touchpad " : "",
             id >= 5 ? ps2tp_name() : id == 4 ? "IntelliMouse Explorer (wheel, 5 buttons)" :
-            id == 3 ? "IntelliMouse (wheel)" : "standard mouse", irq);
+            id == 3 ? "IntelliMouse (wheel)" : stick ? "TrackPoint (middle button scrolls)" : "standard mouse", irq);
     return 0;
 }
 

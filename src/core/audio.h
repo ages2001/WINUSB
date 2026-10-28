@@ -34,6 +34,8 @@ struct ahw {                    /* one direction: hardware ring, 16-bit stereo *
     u8 noflush;                 /* DMA is cache coherent */
     u32 idle;                   /* plat_ms() when it became idle, 0 busy */
     u32 late;                   /* times the device played data we had not written yet */
+    u32 zeroed;                 /* out: silence written up to here (total), ahead of fill */
+    u32 latms;                  /* out: how far ahead to mix (ms), 0: the default of the platform */
 };
 
 struct adev {
@@ -49,9 +51,13 @@ struct adev {
     struct ahw out, in;
     u32 vol[MX_COUNT];          /* MX_*: left | right << 16 */
     u8 hwvol;                   /* MX_MASTER is done by the hardware */
+    u8 mute;                    /* MX_MUTE: master muted */
     u8 gone;                    /* removed (USB): streams stay, nothing is played */
     u8 midiout;                 /* USB MIDI */
-    u8 rsv;
+    u8 irq;                     /* the controller's interrupt line (0xFF none) */
+    u16 pcivid, pcidid;         /* the controller */
+    u16 loc;                    /* PCI bus << 8 | device << 3 | function, 0xFFFF none */
+    u8 hidden;                  /* internal (the sound bridge to WINUSB): not listed to Windows */
 };
 
 #define AT_HDA  1
@@ -91,6 +97,19 @@ void aeng_poll(void);           /* service all devices and streams */
 void aeng_shutdown(void);
 int aeng_api(struct winapireq *r, u8 *buf);
 void aeng_flush_dma(void *p, u32 n);    /* write back CPU caches over a DMA area */
+
+/* internal real-time streams (Sound Blaster emulation) */
+int aeng_rt_open(struct winring *r, u32 rate, int volctl);
+void aeng_rt_run(int id, int run);
+void aeng_rt_rate(int id, u32 rate);
+void aeng_rt_vol(int id, u32 vl, u32 vr);
+u32 aeng_att_cdb(u32 v);                /* volume 0..65535 (linear amplitude) -> attenuation, 1/100 dB */
+void aeng_rt_close(int id);
+void aeng_midi(const u8 *m, int len);   /* to the synthesizer on the default device */
+void aeng_lowlat(int on);               /* DOS: serviced at the RTC rate */
+void aeng_tick(void);
+void aeng_bridge_probe(void);           /* WINAUDIO: the sound bridge to a USB Audio device of WINUSB */
+const char *aeng_bridge_why(void);     /* WINAUDIO: NULL bridged, else the reason it is not */
 
 /* synthesizer (aeng.c calls it while mixing) */
 void synth_init(void);

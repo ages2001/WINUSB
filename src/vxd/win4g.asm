@@ -22,7 +22,7 @@ WIN4G_DDB:
         dd 0                    ; next
         dw 030Ah                ; SDK version (Windows 3.1 layout, loads on 95/98/ME too)
         dw 0                    ; Undefined_Device_ID: no services
-        db 1, 0                 ; version 1.0
+        db 1, 1                 ; version 1.1
         dw 0                    ; flags
         db 'WIN4G   '           ; name
         dd 80000000h            ; Undefined_Init_Order

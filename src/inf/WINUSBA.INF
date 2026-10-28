@@ -1,4 +1,4 @@
-; WINUSBA.INF - WINDRV 1.0 WINUSB for Windows 95, 98 and ME: Sound, video and game controllers
+; WINUSBA.INF - WINDRV 1.1 WINUSB for Windows 95, 98 and ME: Sound, video and game controllers
 ; USB Audio Class 1.0 and 2.0 devices and USB MIDI devices; WINSOUND.DRV (installed with the
 ; controller) plays and records through them.
 
@@ -28,7 +28,7 @@ HKR,,DevLoader,,WINUSB.VXD
 
 [Strings]
 Provider="WINDRV"
-DiskName="WINDRV WINUSB 1.0 disk"
+DiskName="WINDRV WINUSB 1.1 disk"
 UAC2.Desc="WINUSB USB Audio Class 2.0 Device"
 UAC1.Desc="WINUSB USB Audio Class 1.0 Device"
 MIDI.Desc="WINUSB USB MIDI Device"

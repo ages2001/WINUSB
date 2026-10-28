@@ -67,11 +67,16 @@ u32 plat_ms(void);
 void plat_udelay(u32 us);
 void *plat_mmio(u32 phys, u32 len);
 void *plat_rm(u32 segoff);          /* real-mode seg:off -> linear in current context */
+struct winbridge;
+struct winbridge *plat_bridge_peer(void);   /* the other driver's sound bridge block, NULL none */
+void *plat_bridge_ring(struct winbridge *p); /* the ring of the producer's block p, here */
+void plat_bridge_publish(struct winbridge *own); /* VxD: the other VxD finds own */
 void *plat_sysrm(u32 segoff);       /* seg:off in the system VM (rings of WINSOUND.DRV) */
 void plat_key(const u8 *sc, int n);  /* deliver set-1 scan code bytes */
 void plat_mouse(int dx, int dy, int dz, int dw, int buttons);
 int plat_irq_attach(int irq);        /* returns 0 if attached */
 void plat_kick(void);                /* ask platform to call core_poll soon */
+int plat_pnp_ours(u32 bdf);           /* Windows 9x: the function's installed driver is this one */
 void plat_unit_changed(int unit);
 int plat_aux_irq(void);              /* DOS: aux bytes WINUSB.SYS caught on IRQ 12 (PS/2 touchpad) */
 void plat_aux_poll(void);            /* DOS: the PS/2 touchpad after BIOS calls, Windows, resets */
@@ -177,6 +182,7 @@ int blk_read_abs(struct blkdev *d, u64 lba512, u32 cnt512, void *buf);
 int blk_write_abs(struct blkdev *d, u64 lba512, u32 cnt512, const void *buf);
 int blk_dos_request(u8 *pkt);
 void blk_init(void);
+extern int blk_dosunits;
 void blk_explain(int nide, int nahci, int nnvme);
 #define CORENAME_STR "WINDISK"
 void blk_scan_fixed(void);
@@ -192,13 +198,14 @@ extern void (*blk_poll_hook)(void);   /* removable media without hot-plug events
    packet: one ATAPI/SCSI command of 12 bytes; data (len bytes, pool memory) flows to the
    host. Returns 0, 1 = check condition (sense data wanted), -1 = transport error. */
 typedef int (*cd_packet_fn)(void *priv, const u8 *cdb, void *buf, u32 len, u32 ms);
+#define CDP_OUT     0x80000000UL    /* len of a cd_packet_fn: the data goes to the drive */
 struct blkdev *cd_register(const char *model, const char *serial, u8 kind, u32 key, cd_packet_fn packet, void *priv);
 void cd_unregister(struct blkdev *d);
 int cd_count(void);
 struct blkdev *cd_unit(int u);
 int cd_dos_request(u8 *pkt);
 int cd_media(struct blkdev *d);     /* Windows 9x port driver: bit 0 medium, bits 8-15 changes */
-int cd_command(struct blkdev *d, const u8 *cdb, void *buf, u32 len, u8 *sense);
+int cd_command(struct blkdev *d, const u8 *cdb, void *buf, u32 len, u8 *sense);   /* len | CDP_OUT: data out */
 
 /* ---- disk controllers ---- */
 int ahci_probe(struct pcidev *p);

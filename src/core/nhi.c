@@ -390,10 +390,15 @@ void tb_ack_notify(u32 route_lo, u32 route_hi)
 static const u16 intel_nhi_ids[] = {
     0x1513, 0x151A, 0x1547, 0x1548, 0x1567, 0x1569, 0x156B, 0x1575, 0x1577, 0x15BF,
     0x15D2, 0x15D9, 0x15DC, 0x15DD, 0x15DE,             /* Light..Alpine Ridge (FR messages) */
+    0x157D,                                             /* Win Ridge */
     0x15E8, 0x15EB, 0x1134, 0x1137,                     /* Titan Ridge, Maple Ridge */
     0x8A17, 0x8A0D, 0x9A1B, 0x9A1D, 0x9A1F, 0x9A21,     /* Ice Lake, Tiger Lake */
     0x463E, 0x466D, 0xA73E, 0xA76D,                     /* Alder Lake, Raptor Lake */
-    0x7EB2, 0x7EC2, 0x7EC3, 0x6443, 0xE323, 0xE333, 0xE423, 0xE433,
+    0x7EB2, 0x7EC2, 0x7EC3, 0x6443,                     /* Meteor Lake, Arrow Lake */
+    0xA833, 0xA834,                                     /* Lunar Lake */
+    0xE323, 0xE333, 0xE334, 0xE423, 0xE433, 0xE434,     /* Panther Lake */
+    0x4D33,                                             /* Wildcat Lake */
+    0x5781, 0x5784,                                     /* Barlow Ridge (Thunderbolt 5, 80 / 40 Gbit/s) */
     0
 };
 
@@ -406,6 +411,8 @@ int nhi_icm_generation(void)
     case 0x1513: case 0x151A: case 0x1547: case 0x1548: case 0x1567: case 0x1569: case 0x156B:
     case 0x1575: case 0x1577: case 0x15BF: case 0x15D2: case 0x15D9: case 0x15DC: case 0x15DD:
     case 0x15DE:
+        return ICM_GEN_FR;
+    case 0x157D:
         return ICM_GEN_FR;
     case 0x15E8: case 0x15EB: case 0x1134: case 0x1137:
         return ICM_GEN_TR;

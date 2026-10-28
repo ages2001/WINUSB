@@ -1,4 +1,4 @@
-; WINUSBH.INF - WINDRV 1.0 WINUSB for Windows 95, 98 and ME: Human Interface Devices
+; WINUSBH.INF - WINDRV 1.1 WINUSB for Windows 95, 98 and ME: Human Interface Devices
 ; Tablets and touch screens (absolute pointers) and the other USB HID devices; keyboards
 ; and mice are in WINKBD.INF and WINMOU.INF.
 
@@ -47,7 +47,7 @@ HKR,,DevLoader,,WINUSB.VXD
 
 [Strings]
 Provider="WINDRV"
-DiskName="WINDRV WINUSB 1.0 disk"
+DiskName="WINDRV WINUSB 1.1 disk"
 ClassName="Human Interface Devices"
 Tablet.Desc="WINUSB USB HID Tablet / Touch Screen"
 HID.Desc="WINUSB USB HID Device"

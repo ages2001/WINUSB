@@ -83,7 +83,7 @@ int main(int argc, char **argv)
     unsigned long mb = 32, total, done = 0, t0, t1, start = 0;
     unsigned chunk = 64;
     unsigned seg;
-    printf("DSKBENCH 1.0 - sequential read benchmark\n");
+    printf("DSKBENCH 1.1 - sequential read benchmark\n");
     if (_dos_allocmem(0x1000, &seg)) {
         printf("not enough memory\n");
         return 1;

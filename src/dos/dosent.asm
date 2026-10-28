@@ -15,6 +15,9 @@ extern _ent_api
 extern _ent_shutdown
 extern _ent_resume
 extern _ent_filedone
+extern _ent_sbio
+extern _ent_sbtick
+extern _ent_vmstart
 
 segment _HDR
 global _wincore_header
@@ -32,7 +35,9 @@ _wincore_header:
         dd _ent_resume          ; +40
         dd stack_top            ; +44
         dd _ent_filedone        ; +48 firmware files loaded (WINAUDIO)
-        dd 0, 0, 0              ; +52 reserved
+        dd _ent_sbio            ; +52 Sound Blaster emulation: port access
+        dd _ent_sbtick          ; +56 Sound Blaster emulation: RTC tick
+        dd _ent_vmstart         ; +60 WINAUDIO: start the V86 monitor
 
 segment _BSSHEAD
 bss_start:

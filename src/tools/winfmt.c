@@ -61,6 +61,7 @@ const char *win_driver(unsigned char d)
     case UD_MIDI: return "MIDI";
     case UD_TABLET: return "Tablet / touch";
     case UD_VIDEO: return "Camera";
+    case UD_WDM: return "Windows driver";
     }
     return "no driver";
 }

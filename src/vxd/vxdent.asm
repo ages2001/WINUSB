@@ -51,7 +51,7 @@ WINCORE_DDB:
 %else
         dw 03D33h
 %endif
-        db 1, 0                 ; version 1.0
+        db 1, 1                 ; version 1.1
         dw 0                    ; flags
 %ifdef PKG_USB
         db 'WINUSB  '            ; name
@@ -84,6 +84,12 @@ WINCORE_DDB:
         dd 0x50726576           ; 'Prev' as the MASM constant
         dd 80                   ; DDB size (Windows 95 layout)
         dd 0x52737631, 0x52737632, 0x52737633   ; 'Rsv1' 'Rsv2' 'Rsv3'
+; right after the DDB: the sound bridge block of this driver, for the other WINDRV VxD
+; (Get_DDB), see struct winbridge
+global _vxd_link
+_vxd_link:
+        dd 47524257h            ; 'WBRG'
+        dd 0                    ; struct winbridge *
 
 %ifndef PKG_AUDIO
 extern _svc_get_version
@@ -92,6 +98,9 @@ extern _svc_blk_io
 extern _svc_blk_status
 extern _svc_cd_media
 extern _svc_cd_command
+%ifdef PKG_USB
+extern _svc_wb_attach, _svc_wb_list, _svc_wb_desc, _svc_wb_queue, _svc_wb_cancel, _svc_wb_frame, _svc_wb_log
+%endif
 svc_table:
         dd _svc_get_version     ; 0: u32 (void) -> version
         dd _svc_blk_lookup      ; 1: int (u32 devnode, struct pdrinfo *out)
@@ -99,6 +108,15 @@ svc_table:
         dd _svc_blk_status      ; 3: u32 (u32 h) -> PDS_*
         dd _svc_cd_media        ; 4: int (u32 h) -> bit 0 medium, bits 8-15 medium changes
         dd _svc_cd_command      ; 5: int (u32 h, const u8 *cdb, void *buf, u32 len, u8 *sense)
+%ifdef PKG_USB
+        dd _svc_wb_attach       ; 6..11: the USB WDM bridge for WINUSBD.SYS (inc/wdmbr.h)
+        dd _svc_wb_list
+        dd _svc_wb_desc
+        dd _svc_wb_queue
+        dd _svc_wb_cancel
+        dd _svc_wb_frame
+        dd _svc_wb_log          ; 12: void (const char *) -> the driver log
+%endif
 svc_count equ ($ - svc_table) / 4
 %endif
 
@@ -437,6 +455,24 @@ _vmm_version:
         pop ecx
         ret
 
+; u32 vmm_get_ddb(u32 id): DDB of a VxD by device id, 0 none (VMM 4.0)
+global _vmm_get_ddb
+_vmm_get_ddb:
+        push ebx
+        push ecx
+        push edi
+        mov eax, [esp+16]
+        xor edi, edi
+        xor ecx, ecx
+        VMMCALL SVC_Get_DDB
+        mov eax, ecx
+        jnc .ok
+        xor eax, eax
+.ok:    pop edi
+        pop ecx
+        pop ebx
+        ret
+
 ; u32 vmm_init_state(void): VMM_GetSystemInitState of Windows 95/98/ME (VMM 4.0)
 global _vmm_init_state
 _vmm_init_state:
@@ -725,6 +761,35 @@ CMWRAP _cm_read_registry_value, 62, 7
 CMWRAP _cm_write_registry_value, 63, 7
 CMWRAP _cm_set_private_problem, 80, 3
 
+; VMM registry services (C convention, VMM 4.0): arguments copied through
+%macro REGWRAP 3
+global %1
+%1:
+        push ebp
+        mov ebp, esp
+        push ebx
+        push esi
+        push edi
+%assign i %3
+%rep %3
+        push dword [ebp + 4 + 4*i]
+%assign i i-1
+%endrep
+        int 20h
+        dd 00010000h | %2
+        add esp, 4*%3
+        pop edi
+        pop esi
+        pop ebx
+        pop ebp
+        ret
+%endmacro
+
+REGWRAP _vmm_reg_open, 148h, 3
+REGWRAP _vmm_reg_close, 149h, 1
+REGWRAP _vmm_reg_enum, 14Ch, 4
+REGWRAP _vmm_reg_query, 151h, 6
+
 ; CM_Call_At_Appy_Time callback: C function with the reference data on the stack
 extern _vxd_appy
 global _thk_appy
@@ -937,6 +1002,246 @@ _vtd_min_period:
         mov eax, [esp+4]
         VMMCALL SVC_VTD_Begin_Min_Int_Period
         ret
+
+%ifdef PKG_AUDIO
+; ---- Sound Blaster emulation ----
+; I/O handler: EAX = data (out), EBX = VM, ECX = type, EDX = port, EBP -> client registers.
+; Word, dword and string accesses are split into bytes by Simulate_IO.
+extern _vxd_sbio
+global _thk_sbio
+_thk_sbio:
+        test ecx, ~4
+        jz .byte
+        VMMCALL SVC_Simulate_IO
+        ret
+.byte:  push ebx
+        push ecx
+        push edx
+        push esi
+        push edi
+        push ebp
+        cld
+        push ebx
+        and ecx, 4
+        push ecx
+        push eax
+        push edx
+        call _vxd_sbio
+        add esp, 16
+        pop ebp
+        pop edi
+        pop esi
+        pop edx
+        pop ecx
+        pop ebx
+        ret
+
+; Windows 3.x: general protection faults of V86 and protected-mode code (the 8237 status
+; ports, which VDMAD keeps): EBX = VM, EBP -> client registers; handled or on to the next
+extern _vxd_iofault
+global _v86gp_prev, _pmgp_prev
+_v86gp_prev     dd 0
+_pmgp_prev      dd 0
+global _thk_v86gp
+_thk_v86gp:
+        pushad
+        cld
+        push 0
+        push ebp
+        push ebx
+        call _vxd_iofault
+        add esp, 12
+        test eax, eax
+        popad
+        jz .chain
+        ret
+.chain: jmp [_v86gp_prev]
+
+global _thk_pmgp
+_thk_pmgp:
+        pushad
+        cld
+        push 1
+        push ebp
+        push ebx
+        call _vxd_iofault
+        add esp, 12
+        test eax, eax
+        popad
+        jz .chain
+        ret
+.chain: jmp [_pmgp_prev]
+
+; int vmm_hook_fault(u32 pm, u32 vec, void *handler, u32 *prev) -> 0 ok
+global _vmm_hook_fault
+_vmm_hook_fault:
+        push esi
+        mov eax, [esp+12]
+        mov esi, [esp+16]
+        cmp dword [esp+8], 0
+        jne .pm
+        VMMCALL SVC_Hook_V86_Fault
+        jmp .d
+.pm:    VMMCALL SVC_Hook_PM_Fault
+.d:     sbb eax, eax
+        mov edx, [esp+20]
+        mov [edx], esi
+        pop esi
+        ret
+
+; u32 vmm_simulate_in(u32 vm, u32 port, void *client): byte input through the port's handler
+global _vmm_simulate_in
+_vmm_simulate_in:
+        push ebx
+        push ebp
+        mov ebx, [esp+12]
+        mov edx, [esp+16]
+        mov ebp, [esp+20]
+        xor ecx, ecx
+        VMMCALL SVC_Simulate_IO
+        movzx eax, al
+        pop ebp
+        pop ebx
+        ret
+
+; u32 vmm_sel_base(u32 vm, u32 sel): linear base of a selector of the VM (_SelectorMapFlat)
+global _vmm_sel_base
+_vmm_sel_base:
+        push dword 0
+        push dword [esp+12]
+        push dword [esp+12]
+        VMMCALL SVC__SelectorMapFlat
+        add esp, 12
+        ret
+
+; VDMAD callback: EAX = DMA handle, EBX = VM
+extern _vxd_sbdma
+global _thk_sbdma
+_thk_sbdma:
+        pushad
+        cld
+        push ebx
+        push eax
+        call _vxd_sbdma
+        add esp, 8
+        popad
+        ret
+
+; VPICD EOI of the virtual interrupt: EAX = IRQ handle, EBX = VM
+extern _vxd_sbeoi
+global _thk_sbeoi
+_thk_sbeoi:
+        pushad
+        cld
+        push ebx
+        push eax
+        call _vxd_sbeoi
+        add esp, 8
+        popad
+        ret
+
+; physical interrupts on the line we emulate belong to someone else
+global _thk_sbhw
+_thk_sbhw:
+        stc
+        ret
+
+; int vmm_install_io(u32 port, void *handler) -> 0 ok
+global _vmm_install_io
+_vmm_install_io:
+        push esi
+        mov edx, [esp+8]
+        mov esi, [esp+12]
+        VMMCALL SVC_Install_IO_Handler
+        sbb eax, eax
+        pop esi
+        ret
+
+; int vmm_remove_io(u32 port) -> 0 ok (Remove_IO_Handler, VMM 4.0)
+global _vmm_remove_io
+_vmm_remove_io:
+        mov edx, [esp+4]
+        VMMCALL 00010116h
+        sbb eax, eax
+        ret
+
+; u32 vdmad_phys_status(void): AL = 8237 #1 status, AH = #2, as VDMAD keeps them (VDMAD 4.0)
+global _vdmad_phys_status
+_vdmad_phys_status:
+        VMMCALL 0004001Dh               ; VDMAD_Get_Phys_Status
+        movzx eax, ax
+        ret
+
+; void vmm_untrap_io(u32 port)
+global _vmm_untrap_io
+_vmm_untrap_io:
+        mov edx, [esp+4]
+        VMMCALL SVC_Disable_Global_Trapping
+        ret
+
+; u32 vdmad_virtualize(u32 channel, void *callback) -> handle or 0
+global _vdmad_virtualize
+_vdmad_virtualize:
+        push esi
+        mov eax, [esp+8]
+        mov esi, [esp+12]
+        VMMCALL SVC_VDMAD_Virtualize_Channel
+        jnc .ok
+        xor eax, eax
+.ok:    pop esi
+        ret
+
+; void vdmad_get_state(u32 h, u32 vm, u32 *out) : out[0] address, out[1] count, out[2] mode | flags << 8
+global _vdmad_get_state
+_vdmad_get_state:
+        push ebx
+        push esi
+        push edi
+        mov eax, [esp+16]
+        mov ebx, [esp+20]
+        VMMCALL SVC_VDMAD_Get_Virt_State
+        mov edi, [esp+24]
+        mov [edi], esi
+        mov [edi+4], ecx
+        movzx edx, dx
+        mov [edi+8], edx
+        pop edi
+        pop esi
+        pop ebx
+        ret
+
+; void vdmad_set_state(u32 h, u32 vm, u32 addr, u32 count, u32 modeflags)
+global _vdmad_set_state
+_vdmad_set_state:
+        push ebx
+        push esi
+        push edi
+        mov eax, [esp+16]
+        mov ebx, [esp+20]
+        mov esi, [esp+24]
+        mov ecx, [esp+28]
+        mov edx, [esp+32]
+        VMMCALL SVC_VDMAD_Set_Virt_State
+        pop edi
+        pop esi
+        pop ebx
+        ret
+
+; void vpicd_request(u32 irqh, u32 vm, u32 set)
+global _vpicd_request
+_vpicd_request:
+        push ebx
+        mov eax, [esp+8]
+        mov ebx, [esp+12]
+        cmp dword [esp+16], 0
+        je .clr
+        VMMCALL SVC_VPICD_Set_Int_Request
+        pop ebx
+        ret
+.clr:   VMMCALL SVC_VPICD_Clear_Int_Request
+        pop ebx
+        ret
+%endif
 
 ; u64-free cpu helpers
 global _cpu_rdtsc_lo

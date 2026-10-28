@@ -412,7 +412,7 @@ static void aer_inquiry(struct aep_dcb *a)
         d->inquiry_flags[1] = 0x80;
         padcopy(d->vendor_id, PDR_VENDOR, 8);
         padcopy(d->product_id, info.model, 16);
-        padcopy(d->rev_level, "1.0", 4);
+        padcopy(d->rev_level, "1.1", 4);
         padcopy(d->port_name, PDR_VENDOR, 8);
         d->port_specific = info.handle;
         d->rsv2 = m >= 0 ? (u32)m : 0;  /* medium changes seen */
@@ -450,7 +450,7 @@ static void aer_inquiry(struct aep_dcb *a)
     d->inquiry_flags[1] = info.removable ? 0x80 : 0;
     padcopy(d->vendor_id, PDR_VENDOR, 8);
     padcopy(d->product_id, info.model, 16);
-    padcopy(d->rev_level, "1.0", 4);
+    padcopy(d->rev_level, "1.1", 4);
     padcopy(d->port_name, PDR_VENDOR, 8);
     d->port_specific = info.handle;
     a->hdr.result = AEP_SUCCESS;
@@ -596,18 +596,38 @@ struct srb {
 #define SRB_STATUS_NO_DEVICE    0x08
 #define SRB_STATUS_AUTOSENSE_VALID 0x80
 #define SRB_FLAGS_DATA_OUT      0x80
+#define CDP_OUT                 0x80000000UL    /* core_cd_command: data to the drive */
 
 /* SRB data given as a scatter list of the IOR: read here first */
 #define SRB_XBUF 0x10000
 static u8 xbuf[SRB_XBUF];
 
-/* the CD/DVD drive executes the SRB's command (data from the drive only, into the SRB's
-   buffer, the IOR's buffer, or the IOR's scatter list of (blocks, linear address) pairs) */
+/* the IOR's scatter list of (count, linear address) pairs <-> xbuf (to_xbuf: data out). The
+   unit of the counts: blocks of the drive (Windows 95), 512-byte sectors or bytes, whichever
+   adds up to the length */
+static void sg_copy(struct dcb *d, struct ior *ir, u32 len, int to_xbuf)
+{
+    u32 *e = (u32 *)ir->buffer_ptr, off = 0, sum = 0, unit = 1, k;
+    for (k = 0; k < 64 && e[2 * k]; k++) sum += e[2 * k];
+    if (sum * d->actual_blk_size == len) unit = d->actual_blk_size;
+    else if (sum * 512 == len) unit = 512;
+    if (trace) dbghex("pdr:     sg unit ", unit);
+    for (; e[0] && off < len; e += 2) {
+        u32 n = e[0] * unit, i;
+        if (n > len - off) n = len - off;
+        if (to_xbuf) for (i = 0; i < n; i++) xbuf[off + i] = ((u8 *)e[1])[i];
+        else for (i = 0; i < n; i++) ((u8 *)e[1])[i] = xbuf[off + i];
+        off += n;
+    }
+}
+
+/* the CD/DVD drive executes the SRB's command (data from or to the drive: the SRB's buffer,
+   the IOR's buffer, or the IOR's scatter list of (blocks, linear address) pairs) */
 static u16 do_srb(struct dcb *d, struct srb *b, struct ior *ir)
 {
     u8 sense[18];
     u32 buf = b->data_buffer, len = b->data_length;
-    int r, sg = 0;
+    int r, sg = 0, out;
     if (trace) {
         dbghex("pdr:     srb func/cdb0 ", ((u32)b->function << 8) | b->cdb[0]);
         dbghex("pdr:     srb flags ", b->flags);
@@ -619,10 +639,7 @@ static u16 do_srb(struct dcb *d, struct srb *b, struct ior *ir)
         b->srb_status = SRB_STATUS_SUCCESS;
         return IORS_SUCCESS;
     }
-    if ((b->flags & SRB_FLAGS_DATA_OUT) && len) {
-        b->srb_status = SRB_STATUS_INVALID_REQUEST;
-        return IORS_INVALID_COMMAND;
-    }
+    out = (b->flags & SRB_FLAGS_DATA_OUT) && len;
     if (len && (ir->flags & IORF_SCATTER_GATHER) && (!buf || buf == ir->buffer_ptr)) {
         /* the IOR's scatter list (Windows 98 puts its address into the SRB too) */
         if (len > SRB_XBUF) {
@@ -631,28 +648,16 @@ static u16 do_srb(struct dcb *d, struct srb *b, struct ior *ir)
         }
         buf = (u32)xbuf;
         sg = 1;
+        if (out) sg_copy(d, ir, len, 1);
     } else if (!buf && len) {
         buf = ir->buffer_ptr;
     }
     sense[2] = sense[12] = sense[13] = 0;
-    r = core_cd_command(d->port_specific, b->cdb, (void *)buf, buf ? len : 0, sense);
+    /* data to the drive too (MODE SELECT: the volume of the audio outputs, ...) */
+    r = core_cd_command(d->port_specific, b->cdb, (void *)buf, buf ? (len | (out ? CDP_OUT : 0)) : 0, sense);
     if (trace) dbghex("pdr:     result/key/asc ", ((u32)(r & 0xFF) << 24) | ((u32)(sense[2] & 0x0F) << 16) | ((u32)sense[12] << 8) | sense[13]);
     if (r == 0) {
-        if (sg) {
-            /* the unit of the counts: blocks of the drive (Windows 95), 512-byte sectors or
-               bytes, whichever adds up to the length */
-            u32 *e = (u32 *)ir->buffer_ptr, off = 0, sum = 0, unit = 1, k;
-            for (k = 0; k < 64 && e[2 * k]; k++) sum += e[2 * k];
-            if (sum * d->actual_blk_size == len) unit = d->actual_blk_size;
-            else if (sum * 512 == len) unit = 512;
-            if (trace) dbghex("pdr:     sg unit ", unit);
-            for (; e[0] && off < len; e += 2) {
-                u32 n = e[0] * unit, i;
-                if (n > len - off) n = len - off;
-                for (i = 0; i < n; i++) ((u8 *)e[1])[i] = xbuf[off + i];
-                off += n;
-            }
-        }
+        if (sg && !out) sg_copy(d, ir, len, 0);
         b->srb_status = SRB_STATUS_SUCCESS;
         return IORS_SUCCESS;
     }

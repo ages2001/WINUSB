@@ -134,7 +134,8 @@ static int switch_enum(struct tb_switch *sw)
     sw->upstream = (u8)((hdr[1] >> 8) & 0x3F);
     sw->nports = (u8)((hdr[1] >> 14) & 0x3F);
     sw->cs4 = hdr[4];
-    sw->usb4 = (u8)(((hdr[4] >> 24) & 0xFF) == USB4_VERSION_1_0);
+    /* USB4 1.0 routers report 20h, USB4 2.0 (Thunderbolt 5, 80 Gbit/s) 40h; Thunderbolt 1-3 1..3 */
+    sw->usb4 = (u8)(((hdr[4] >> 24) & 0xFF) >= USB4_VERSION_1_0);
     sw->generation = (u8)((hdr[4] >> 24) & 0xFF);
     if (sw->nports >= TB_MAX_PORTS) sw->nports = TB_MAX_PORTS - 1;
     memset(sw->ports, 0, sizeof(sw->ports));
@@ -348,7 +349,12 @@ static int switch_configure(struct tb_switch *sw, struct tb_switch *parent)
     if (sw_read(sw, ROUTER_CS_1, hdr, 1)) return -1;
     hdr[0] = (hdr[0] & ~(7UL << 20)) | ((u32)sw->depth << 20);
     if (sw->usb4) {
+        u32 v;
         if (sw_write(sw, ROUTER_CS_1, hdr, 1)) return -1;
+        /* the connection manager's USB4 version (CMUV): a USB4 2.0 router shows its
+           additional capabilities only to a version 2 connection manager */
+        v = (sw->cs4 & 0xFFFF0000UL) | ((sw->generation >= 0x40 ? 0x20UL : 0x10UL) << 8) | 0xFF;
+        sw_write(sw, ROUTER_CS_4, &v, 1);
         usb4_ports_setup(sw);
         if (usb4_switch_setup(sw, parent)) return -1;
     } else {

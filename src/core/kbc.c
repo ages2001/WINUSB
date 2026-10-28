@@ -1,7 +1,8 @@
 /* kbc.c - the 8042 keyboard controller seen from the mouse side: commands to the auxiliary
    (PS/2 mouse / touchpad) device with the aux interrupt off, polled answers. Keyboard bytes
-   that arrive meanwhile are kept and handed back afterwards through the controller (D2h, as if
-   the keyboard had sent them); aux bytes that are no answer go to kbc_stray (the packet decoder
+   that arrive meanwhile are kept and handed back afterwards: to kbc_kbd_sink (the platform's
+   keyboard queue: one byte at a time once the owner has read the previous one, or VKD), else
+   through the controller (D2h, as if the keyboard had sent them); aux bytes that are no answer go to kbc_stray (the packet decoder
    while the mouse runs). Used by the VxD (ps2.c) and by the DOS core (platdos.c). */
 #include "usb.h"
 
@@ -14,7 +15,8 @@
 #define CCB_ADIS    0x20
 
 void (*kbc_stray)(u8 b);
-static u8 kbd_save[16];
+void (*kbc_kbd_sink)(const u8 *b, int n);
+static u8 kbd_save[32];
 static int kbd_nsave;
 
 int kbc_wait_in(void)
@@ -79,6 +81,13 @@ void kbc_flush(void)
 void kbc_kbd_restore(void)
 {
     int i;
+    if (kbc_kbd_sink && kbd_nsave) {
+        /* a key release must never get lost (a Shift that stays down): the bytes go through
+           the queue, the owner reads one before the next one is injected */
+        kbc_kbd_sink(kbd_save, kbd_nsave);
+        kbd_nsave = 0;
+        return;
+    }
     for (i = 0; i < kbd_nsave; i++) {
         u32 n;
         kbc_write(0xD2, kbd_save[i]);

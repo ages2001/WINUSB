@@ -167,8 +167,30 @@ static void test_synaptics(void)
     /* tap: left click; two-finger tap: right click */
     ev_reset();
     syn(3000, 3000, 60, 6, 0); syn(3002, 3000, 60, 6, 0); syn(0, 0, 0, 0, 0);
-    run(100);
+    run(300);
     CHECK(ev_clicks[0] == 1 && !ev_lastbtn, "tap: clicks %d", ev_clicks[0]);
+    /* tap and drag: the button stays down while the finger moves, up when it lifts */
+    ev_reset();
+    syn(3000, 3000, 60, 6, 0); syn(3002, 3000, 60, 6, 0); syn(0, 0, 0, 0, 0);
+    run(50);
+    for (i = 0; i < 30; i++) syn(3000 + i * 40, 3000, 60, 6, 0);
+    CHECK(ev_btn == 1 && ev_dx > 30, "tap and drag: buttons %d dx %d", ev_btn, ev_dx);
+    syn(0, 0, 0, 0, 0);
+    run(300);
+    CHECK(ev_clicks[0] == 1 && !ev_lastbtn, "drag ends: clicks %d btn %d", ev_clicks[0], ev_lastbtn);
+    /* double tap: two clicks */
+    ev_reset();
+    syn(3000, 3000, 60, 6, 0); syn(3002, 3000, 60, 6, 0); syn(0, 0, 0, 0, 0);
+    run(50);
+    syn(3000, 3000, 60, 6, 0); syn(3002, 3000, 60, 6, 0); syn(0, 0, 0, 0, 0);
+    run(300);
+    CHECK(ev_clicks[0] == 2 && !ev_lastbtn, "double tap: clicks %d", ev_clicks[0]);
+    /* three fingers (W 1) to the right: back (button 4) */
+    ev_reset();
+    for (i = 0; i < 30; i++) syn(2000 + i * 80, 3000, 70, 1, 0);
+    syn(0, 0, 0, 0, 0);
+    run(300);
+    CHECK(ev_clicks[3] == 1 && !ev_dx, "three-finger swipe: back %d pointer %d", ev_clicks[3], ev_dx);
     ev_reset();
     syn(3000, 3000, 60, 0, 0); syn(3002, 3000, 60, 0, 0); syn(0, 0, 0, 0, 0);
     run(100);

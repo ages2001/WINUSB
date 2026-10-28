@@ -319,6 +319,7 @@ void ps2tp_byte(u8 b);
 u32 ps2tp_stats(u32 *bad);
 /* kbc.c: the 8042 from the aux side (commands polled, aux interrupt off) */
 extern void (*kbc_stray)(u8 b);
+extern void (*kbc_kbd_sink)(const u8 *b, int n);
 extern const struct ps2io kbc_io;
 int kbc_wait_in(void);
 int kbc_cmd(u8 c);
@@ -338,5 +339,11 @@ void smbtp_poll(void);
 int smbtp_active(void);
 void msc_tick(void);
 int msc_eject(struct usb_dev *d);
+/* usbwdm.c */
+extern struct usb_class wdm_class;
+extern int usb_wdm_on;
+extern u16 usb_wdm_ids[8][2];
+extern int usb_wdm_nids;
+int usb_wdm_forced(struct usb_dev *d);
 
 #endif

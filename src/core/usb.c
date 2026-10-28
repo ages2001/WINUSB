@@ -8,7 +8,8 @@ struct usb_dev *usb_devices;
 static struct usb_hub *hubs;
 static u16 nextid = 1;
 static u8 *ctlbuf;              /* bounce for synchronous control transfers */
-static struct usb_class *classes[] = { &hub_class, &hid_class, &msc_class, &uaudio_class, &uvc_class };
+/* the WDM bridge (Windows 98 / ME) takes what the others leave */
+static struct usb_class *classes[] = { &hub_class, &hid_class, &msc_class, &uaudio_class, &uvc_class, &wdm_class };
 static struct usb_iso *isos;
 
 u32 speed_maxpkt0(int speed)
@@ -611,9 +612,11 @@ static void bind_classes(struct usb_dev *d)
 {
     u8 *p = d->cdesc, *end = d->cdesc + d->cdesc_len;
     u32 k;
+    int force = usb_wdm_forced(d);
     while (p && p + 2 <= end && p[0]) {
         if (p[1] == 4 && p[3] == 0 && d->ncls < 4) {     /* interface, alternate 0 */
             for (k = 0; k < ARRAY_SIZE(classes); k++) {
+                if (force && classes[k] != &wdm_class) continue;
                 if (classes[k]->probe(d, p, end) == 0) {
                     d->cls[d->ncls++] = classes[k];
                     break;
@@ -878,6 +881,7 @@ void usb_poll(void)
     msc_tick();
     uaudio_tick();              /* sound engine: rings of the USB audio devices */
     iso_service_all();          /* packets for the next frames */
+    wdm_class.poll();           /* requests of the WDM bridge */
 }
 
 void usb_shutdown(void)
@@ -990,6 +994,7 @@ static void tree_hub(struct usb_hub *h, struct winusbnode *out, int max, int *n,
         nd->xfers = d->xfers;
         nd->slot = d->slot;
         nd->driver = d->driver;
+        if (d->driver == UD_NONE && d->ncls && d->cls[0] == &wdm_class) nd->driver = UD_WDM;
         nd->rsv = d->drvinfo;
         nd->hctype = h->hc->ops->type;
         nd->iface_count = d->cdesc ? d->cdesc[4] : 0;

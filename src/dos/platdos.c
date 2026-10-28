@@ -161,18 +161,65 @@ void *plat_sysrm(u32 segoff)
     return plat_rm(segoff);
 }
 
-/* ---- 8042 injection queue, drained by WINDISK.SYS / WINUSB.SYS in real mode ---- */
-static int kq_space(void)
+/* the sound bridge: the drivers linked their control blocks at their start */
+struct winbridge *plat_bridge_peer(void)
+{
+    struct winbridge *own = (struct winbridge *)((u8 *)cb + WIN_BROFF);
+    if (!own->peer) return NULL;
+    return (struct winbridge *)((u8 *)plat_rm(own->peer) + WIN_BROFF);
+}
+
+void *plat_bridge_ring(struct winbridge *p)
+{
+    return plat_mmio(p->phys, p->size + 32);
+}
+
+void plat_bridge_publish(struct winbridge *own)
+{
+    (void)own;
+}
+
+/* ---- 8042 injection queue, drained by WINDISK.SYS / WINUSB.SYS in real mode ----
+   The control block holds 20 entries; more wait here (a burst of keys, a mouse packet
+   stream) and move up whenever the driver has drained some: no byte is dropped, so no key
+   release is lost. */
+#define KQ2LEN 256
+static u16 kq2[KQ2LEN];
+static u16 kq2_head, kq2_tail;
+
+static int kq_hw_space(void)
 {
     int used = (cb->kq_head - cb->kq_tail + WIN_KQLEN) % WIN_KQLEN;
     return WIN_KQLEN - 1 - used;
 }
 
+static void kq_move(void)
+{
+    while (kq2_tail != kq2_head && kq_hw_space() > 0) {
+        cb->kq[cb->kq_head] = kq2[kq2_tail];
+        cb->kq_head = (u8)((cb->kq_head + 1) % WIN_KQLEN);
+        kq2_tail = (u16)((kq2_tail + 1) % KQ2LEN);
+    }
+}
+
+static int kq_space(void)
+{
+    return KQ2LEN - 1 - (int)((kq2_head - kq2_tail + KQ2LEN) % KQ2LEN) + kq_hw_space();
+}
+
 static void kq_put(u8 cmd, u8 data)
 {
-    if (kq_space() <= 0) return;
-    cb->kq[cb->kq_head] = (u16)(((u16)cmd << 8) | data);
-    cb->kq_head = (u8)((cb->kq_head + 1) % WIN_KQLEN);
+    u16 nh;
+    kq_move();
+    if (kq2_head == kq2_tail && kq_hw_space() > 0) {
+        cb->kq[cb->kq_head] = (u16)(((u16)cmd << 8) | data);
+        cb->kq_head = (u8)((cb->kq_head + 1) % WIN_KQLEN);
+        return;
+    }
+    nh = (u16)((kq2_head + 1) % KQ2LEN);
+    if (nh == kq2_tail) return;
+    kq2[kq2_head] = (u16)(((u16)cmd << 8) | data);
+    kq2_head = nh;
 }
 
 /* push one queued byte into the controller if its output buffer is free */
@@ -182,6 +229,7 @@ static void kq_drain(void)
     u16 e;
     int i;
     u8 st;
+    kq_move();
     if (cb->kq_head == cb->kq_tail) return;
     st = inb(0x64);
     if ((st & 0x21) == 0x21) {
@@ -205,13 +253,11 @@ static void kq_drain(void)
 void plat_key(const u8 *sc, int n)
 {
     if (cb->opts & OPT_NOKBC) return;
-    while (n--) {
-        if (kq_space() <= 0) {
-            kprintf("dos: key queue full\n");
-            return;
-        }
-        kq_put(0xD2, *sc++);
+    if (kq_space() < n) {
+        kprintf("dos: key queue full\n");
+        return;
     }
+    while (n--) kq_put(0xD2, *sc++);
     kq_drain();
 }
 
@@ -252,6 +298,12 @@ static void wheel_to_keys(int dz)
     }
 }
 
+int plat_pnp_ours(u32 bdf)
+{
+    (void)bdf;
+    return 1;
+}
+
 #ifdef WIN_USB
 #include "usb.h"
 /* ---- PS/2 touchpad (Synaptics / ELAN, ps2tp.c) in DOS mode ----
@@ -261,6 +313,7 @@ static void wheel_to_keys(int dz)
    mailbox. Pointing device BIOS calls reach the touchpad itself (a reset puts it back into its
    mouse mode): it is programmed again once they are over. */
 static u8 aux_state;                /* 0 not ours, 1 touchpad on PS/2 */
+static u8 aux_probed, aux_wastp;    /* probed once; a touchpad was found */
 static u8 aux_bioscnt, aux_dirty;
 static u32 aux_bios_ms, aux_check_ms, aux_good0, aux_bad0;
 
@@ -310,21 +363,39 @@ int plat_aux_irq(void)
     return 1;
 }
 
+/* keyboard bytes that came while the touchpad was being programmed: back through the queue */
+static void dos_kbd_sink(const u8 *b, int n)
+{
+    while (n-- > 0) kq_put(0xD2, *b++);
+    kq_drain();
+}
+
 static void aux_start(void)
 {
     struct wincbx *x = cbx();
     u8 ccb;
     int found = 0;
     if (aux_state || (cb->opts & OPT_NOKBC) || (cb->opts2 & OPT2_NOTP) || !(cb->opts & OPT_USB)) return;
+    /* a DOS mouse driver already runs the mouse and no touchpad was found before: the probe
+       would only undo the driver's settings (rate, resolution, wheel mode) */
+    if ((cb->flags & CBF_AUXBIOS) && aux_probed && !aux_wastp) return;
+    kbc_kbd_sink = dos_kbd_sink;
     kbc_stray = NULL;
     if (kbc_begin(&ccb)) return;
     if (!(aux_cmd(0xF5) && aux_cmd(0xF5)) && !aux_cmd(0xF6)) found = ps2tp_probe(&kbc_io, plat_mouse);
     /* PS/2 even for a pad with an SMBus side: its bytes come by interrupt, SMBus would only be
        polled at the timer rate here */
+    aux_probed = 1;
+    aux_wastp = (u8)(found != 0);
     if (found) {
         if (!aux_cmd(0xF4)) aux_state = 1;
-    } else if (cb->flags & CBF_AUXBIOS) {
-        aux_cmd(0xF4);                  /* the DOS driver's mouse streams again */
+    } else {
+        /* the knocks may have left another device in a special mode: power-on state again */
+        if (!aux_cmd(0xFF)) {
+            kbc_read(1, 1000);          /* AAh */
+            kbc_read(1, 30);            /* 00h */
+        }
+        if (cb->flags & CBF_AUXBIOS) aux_cmd(0xF4);    /* the DOS driver's mouse streams again */
     }
     kbc_end(ccb, aux_state || (ccb & 2));
     if (!aux_state) return;
@@ -545,19 +616,46 @@ void plat_unit_changed(int unit)
     (void)unit;
 }
 
-/* TSC calibration against PIT channel 2 (10 ms one-shot) */
+/* PIT channel 0 count (latched) */
+static u16 pit0(void)
+{
+    u8 lo, hi;
+    outb(0x43, 0x00);
+    lo = inb(0x40);
+    hi = inb(0x40);
+    return (u16)(lo | (hi << 8));
+}
+
+/* TSC calibration against PIT channel 2 (10 ms one-shot). Where its output never shows in
+   port 61h, channel 0 (the timer tick, always running) is counted instead. */
 static void calibrate(void)
 {
-    u32 t0, t1;
+    u32 t0, t1, n = 0;
     u8 v = inb(0x61);
     outb(0x61, (u8)((v & ~0x02) | 0x01));
     outb(0x43, 0xB0);                   /* ch2, lobyte/hibyte, mode 0 */
     outb(0x42, (u8)(11932 & 0xFF));
     outb(0x42, (u8)(11932 >> 8));
     t0 = rdtsc_lo();
-    while (!(inb(0x61) & 0x20)) ;
+    while (!(inb(0x61) & 0x20) && ++n < 500000UL) ;
     t1 = rdtsc_lo();
     outb(0x61, v);
+    if (n >= 500000UL) {
+        u32 clocks = 0;
+        u16 prev, cur;
+        int sq;
+        outb(0x43, 0xE2);               /* read back the status of channel 0: its mode */
+        sq = ((inb(0x40) >> 1) & 3) == 3;     /* square wave: two counts per clock */
+        prev = pit0();
+        t0 = rdtsc_lo();
+        for (n = 0; clocks < 11932UL && n < 5000000UL; n++) {
+            cur = pit0();
+            clocks += (u16)(prev - cur) >> sq;
+            prev = cur;
+        }
+        t1 = rdtsc_lo();
+        if (clocks) t1 = t0 + (u32)(((u64)(t1 - t0) * 11932UL) / clocks);
+    }
     tsc_per_ms = (t1 - t0) / 10;
     tsc_per_us = tsc_per_ms / 1000;
     if (!tsc_per_ms) tsc_per_ms = 1;
@@ -571,10 +669,85 @@ static void session(void)
 static void session_end(void)
 {
     if (cb) {
+        kq_move();
         ps2_flush();
         cb->pollcnt++;
     }
 }
+
+#ifdef WIN_AUDIO
+/* ---- Sound Blaster emulation: WINAUDIO.SYS traps the ports through the QPI of QEMM or
+   JEMM + QPIEMU and passes each access here; the RTC periodic interrupt services the sound
+   between timer ticks and delivers the interrupt to the program ---- */
+#include "audio.h"
+#include "sbemu.h"
+
+u32 plat_us(void)
+{
+    return (u32)((rdtsc64() - tsc_base) / tsc_per_us);
+}
+
+/* the DMA addresses of a real-mode program are its linear addresses */
+u8 *plat_sb_mem(u32 lin, u32 len)
+{
+    if (!lin || lin + len > 0x110000UL) return NULL;
+    return (u8 *)lin;
+}
+
+void plat_sb_irq(int level)
+{
+    struct winsb *c = sb_cfg();
+    if (level && !c->irqline) c->irqedge = 1;
+    c->irqline = (u8)level;
+}
+
+void plat_sb_dma(int which, u32 left, int tc)
+{
+    (void)which; (void)left; (void)tc;
+}
+
+int plat_sb_start(void)
+{
+    return 0;
+}
+
+/* port access: port | value << 16 | out << 24 */
+u32 __cdecl ent_sbio(u32 arg)
+{
+    return sb_io(arg & 0xFFFF, (arg >> 16) & 0xFF, (int)((arg >> 24) & 1));
+}
+
+/* RTC tick */
+u32 __cdecl ent_sbtick(u32 arg)
+{
+    static u8 low;
+    (void)arg;
+    if (!low) {
+        low = 1;
+        aeng_lowlat(1);
+    }
+    aeng_tick();
+    return 0;
+}
+#else
+u32 __cdecl ent_vmstart(u32 arg)
+{
+    (void)arg;
+    return 1;
+}
+
+u32 __cdecl ent_sbio(u32 arg)
+{
+    (void)arg;
+    return 0xFF;
+}
+
+u32 __cdecl ent_sbtick(u32 arg)
+{
+    (void)arg;
+    return 0;
+}
+#endif
 
 /* ---- entry points listed in the WINCORE.BIN header ---- */
 u32 __cdecl ent_init(struct core_params *p)
@@ -666,8 +839,10 @@ u32 __cdecl ent_poll(u32 arg)
     static u32 next_poll;
     (void)arg;
     session();
-    if ((s32)(plat_ms() - next_poll) < 0 && !(cb->flags & CBF_KICK))
+    if ((s32)(plat_ms() - next_poll) < 0 && !(cb->flags & CBF_KICK)) {
+        kq_move();
         return 0;
+    }
     cb->flags &= ~CBF_KICK;
     core_poll();
     next_poll = plat_ms() + 40;

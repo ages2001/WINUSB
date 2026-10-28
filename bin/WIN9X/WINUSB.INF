@@ -1,4 +1,4 @@
-; WINUSB.INF - WINDRV 1.0 WINUSB for Windows 95, 98 and ME: Universal Serial Bus controllers
+; WINUSB.INF - WINDRV 1.1 WINUSB for Windows 95, 98 and ME: Universal Serial Bus controllers
 ; UHCI (USB 1.1), OHCI (USB 1.1), EHCI (USB 2.0), xHCI (USB 3.x) and USB4 host controllers,
 ; USB hubs and the USB devices without a class driver of WINDRV. WINUSB.VXD drives the
 ; controllers and enumerates the devices; the other classes have their own INF files:
@@ -6,6 +6,8 @@
 ;   WINUSBH.INF tablets, touch screens, other HID  WINUSBA.INF USB Audio 1.0 / 2.0, MIDI
 ;   WINUSBV.INF USB Video Class cameras             WINUSBD.INF USB disks (BOT, UAS)
 ;   WINUSBS.INF Thunderbolt / USB4 host interfaces, Intel LPSS I2C (System devices)
+; The other USB devices go to their own Windows drivers on Windows 98 and ME through the USB WDM
+; bridge: WINUSBW.SYS, a WDM bus driver, reports them as USB\VID_xxxx&PID_xxxx devices.
 
 [Version]
 Signature="$CHICAGO$"
@@ -31,6 +33,7 @@ DefaultDestDir=11
 Class.Copy=11
 WINUSB.CopyPdr=12
 WINUSB.CopyInf=17
+WINUSB.CopyWdm=10,SYSTEM32\DRIVERS
 
 [SourceDisksNames]
 1=%DiskName%,,0
@@ -39,6 +42,8 @@ WINUSB.CopyInf=17
 WINUSB.VXD=1
 WIN4G.VXD=1
 WINUSB.PDR=1
+WINUSBW.SYS=1
+USBD.SYS=1
 WINDRVCI.DLL=1
 WINMOUSE.DRV=1
 WINSOUND.DRV=1
@@ -71,17 +76,18 @@ WINMOU.INF=1
 %Hub11.Desc%=WINUSB.Dev,WINUSB\HUB11
 %Hub.Desc%=WINUSB.Dev,WINUSB\HUB
 %Other.Desc%=WINUSB.Dev,WINUSB\DEVICE
+%WDM.Desc%=WINUSB.WDM,WINUSB\WDMBUS
 
 ; ---- host controllers: WINUSB.VXD is the DevLoader and the enumerator of the USB devices ----
 [WINUSB.HC]
-CopyFiles=WINUSB.CopyVxd,WINUSB.CopyPdr,WINUSB.CopyInf,Class.Copy
+CopyFiles=WINUSB.CopyVxd,WINUSB.CopyPdr,WINUSB.CopyWdm,WINUSB.CopyInf,Class.Copy
 AddReg=WINUSB.HC.AddReg
 UpdateInis=WINUSB.Inis
 
 [WINUSB.HC.AddReg]
 HKR,,DevLoader,,WINUSB.VXD
 HKR,,Options,,""
-HKR,,DriverDesc,,"%Provider% WINUSB 1.0"
+HKR,,DriverDesc,,"%Provider% WINUSB 1.1"
 
 [WINUSB.CopyVxd]
 WINUSB.VXD
@@ -95,6 +101,12 @@ WINMIX.EXE
 
 [WINUSB.CopyPdr]
 WINUSB.PDR
+
+; USBD.SYS (descriptor helpers the Windows drivers import) only where Windows' own is missing
+; (16: an existing file is not overwritten)
+[WINUSB.CopyWdm]
+WINUSBW.SYS
+USBD.SYS,,,16
 
 [WINUSB.CopyInf]
 WINUSBD.INF
@@ -117,6 +129,7 @@ system.ini,386Enh,,"device=winusb.vxd"
 system.ini,boot,"mouse.drv=*","mouse.drv=winmouse.drv"
 system.ini,drivers,,"wave=winsound.drv"
 system.ini,drivers,,"midi=winsound.drv"
+system.ini,drivers,,"mixer=winsound.drv"
 win.ini,windows,,"load=winwheel.exe"
 
 ; ---- hubs and other devices: served by WINUSB.VXD (the enumerator) itself, which registers a
@@ -127,16 +140,28 @@ AddReg=WINUSB.Dev.AddReg
 [WINUSB.Dev.AddReg]
 HKR,,DevLoader,,WINUSB.VXD
 
+; ---- the USB WDM bridge (Windows 98 / ME): WINUSBW.SYS, loaded by NTKERN, is the bus driver of
+; the USB devices WINDRV has no class driver for; their Windows drivers (vendor drivers,
+; Windows' HID, printer, scanner, modem drivers) load on the devices it reports ----
+[WINUSB.WDM]
+CopyFiles=WINUSB.CopyWdm
+AddReg=WINUSB.WDM.AddReg
+
+[WINUSB.WDM.AddReg]
+HKR,,DevLoader,,*ntkern
+HKR,,NTMPDriver,,WINUSBW.SYS
+
 [Strings]
 Provider="WINDRV"
 ClassName="Universal Serial Bus controllers"
-DiskName="WINDRV WINUSB 1.0 disk"
+DiskName="WINDRV WINUSB 1.1 disk"
 UHCI.Desc="WINUSB USB 1.1 UHCI Universal Host Controller"
 OHCI.Desc="WINUSB USB 1.1 OHCI Open Host Controller"
 EHCI.Desc="WINUSB USB 2.0 EHCI Enhanced Host Controller"
 xHCI.Desc="WINUSB USB 3.x xHCI eXtensible Host Controller"
-USB4.Desc="WINUSB USB4 Host Router"
+USB4.Desc="WINUSB USB4 Host Router (Thunderbolt 4 / 5)"
 USB.Desc="WINUSB USB Host Controller (UHCI / OHCI / EHCI / xHCI)"
+WDM.Desc="WINUSB USB WDM Bridge (Windows drivers of USB devices)"
 Hub30.Desc="WINUSB USB 3.x SuperSpeed Hub"
 Hub20.Desc="WINUSB USB 2.0 High-Speed Hub"
 Hub11.Desc="WINUSB USB 1.1 Full-Speed Hub"

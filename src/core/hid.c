@@ -53,6 +53,12 @@ struct hiddev {
     u8 rep_key;
     u32 rep_time;
     int rep_active;
+    /* keyboard in report protocol (an interface without the boot subclass): the layout from
+       the report descriptor (report id, modifier bits, key array or key bitmap) */
+    u8 krep, kid;
+    s16 kmod, karr, kbmp;
+    u8 karrn, karrsz;
+    u16 kbmpn, kbmpmin;
     /* mouse */
     int boot;
     u8 repid;
@@ -131,6 +137,8 @@ static void kbd_report(struct hiddev *h, const u8 *r)
     memcpy(h->last, r, 8);
 }
 
+static void kbd_report_rep(struct hiddev *h, const u8 *r, u32 len);
+
 static s32 getbits(const u8 *d, u32 len, struct hidfield *f)
 {
     u32 v = 0, i;
@@ -188,7 +196,8 @@ static void hid_cb(struct usb_xfer *x)
 {
     struct hiddev *h = x->priv;
     if (x->status == XS_OK) {
-        if (h->kind == 1 && x->actual >= 8) kbd_report(h, x->buf);
+        if (h->kind == 1 && h->krep) kbd_report_rep(h, x->buf, x->actual);
+        else if (h->kind == 1 && x->actual >= 8) kbd_report(h, x->buf);
         else if (h->kind == 2 && x->actual) mouse_report(h, x->buf, x->actual);
         else if (h->kind == 3 && x->actual) ptp_input(h->ptp, x->buf, x->actual);
         usb_submit(x);
@@ -197,6 +206,124 @@ static void hid_cb(struct usb_xfer *x)
     } else if (x->status != XS_CANCEL && x->status != XS_GONE && !h->dev->gone) {
         usb_submit(x);
     }
+}
+
+/* ---- report descriptor parser (keyboard layout) ---- */
+static int parse_kbd(struct hiddev *h, const u8 *p, int n)
+{
+    u32 upage = 0, rsize = 0, rcount = 0, umin = 0, umax = 0;
+    u32 usage0 = 0;
+    int nus = 0, coll = 0, in_kbd = 0, done = 0;
+    s32 off = 0;
+    u8 cur_id = 0;
+    h->kmod = h->karr = h->kbmp = -1;
+    h->kid = 0;
+    while (n > 0 && !done) {
+        u8 b = *p++;
+        u32 sz = b & 3, v = 0, k;
+        u8 tag = (u8)(b >> 4), type = (u8)((b >> 2) & 3);
+        n--;
+        if (b == 0xFE) {
+            if (n < 2) break;
+            k = p[0];
+            p += 2 + k; n -= 2 + (int)k;
+            continue;
+        }
+        if (sz == 3) sz = 4;
+        if ((int)sz > n) break;
+        for (k = 0; k < sz; k++) v |= (u32)p[k] << (8 * k);
+        p += sz; n -= (int)sz;
+        if (type == 1) {
+            switch (tag) {
+            case 0: upage = v; break;
+            case 7: rsize = v; break;
+            case 8:
+                if (in_kbd && h->kid && cur_id != (u8)v && (h->kmod >= 0 || h->karr >= 0 || h->kbmp >= 0)) {
+                    done = 1;
+                    break;
+                }
+                cur_id = (u8)v; off = 0;
+                break;
+            case 9: rcount = v; break;
+            }
+        } else if (type == 2) {
+            if (tag == 0 && !nus++) usage0 = (sz == 4) ? v : (upage << 16) | v;
+            if (tag == 1) umin = (sz == 4) ? v : (upage << 16) | v;
+            if (tag == 2) umax = (sz == 4) ? v : (upage << 16) | v;
+        } else if (type == 0) {
+            if (tag == 0x0A) {
+                if (v == 1 && nus && usage0 == 0x00010006UL) in_kbd = 1;
+                coll++;
+            } else if (tag == 0x0C) {
+                coll--;
+                if (in_kbd && coll == 0) done = 1;
+            } else if (tag == 0x08 && in_kbd) {
+                if (!(v & 1) && (umin >> 16) == 7) {
+                    if (!h->kid) h->kid = cur_id;
+                    if (cur_id == h->kid) {
+                        if (v & 2) {            /* variable: one bit per key */
+                            if ((umin & 0xFFFF) == 0xE0 && rsize == 1 && h->kmod < 0) h->kmod = (s16)off;
+                            else if (rsize == 1 && h->kbmp < 0) {
+                                h->kbmp = (s16)off;
+                                h->kbmpmin = (u16)umin;
+                                h->kbmpn = (u16)rcount;
+                            }
+                        } else if (h->karr < 0 && (rsize == 8 || rsize == 16)) {    /* array of usages */
+                            h->karr = (s16)off;
+                            h->karrn = (u8)rcount;
+                            h->karrsz = (u8)rsize;
+                        }
+                    }
+                }
+                off += (s32)(rsize * rcount);
+            }
+            if (tag == 0x08 || tag == 0x09 || tag == 0x0B || tag == 0x0A || tag == 0x0C) {
+                nus = 0; umin = umax = 0;
+            }
+        }
+    }
+    (void)umax;
+    return h->karr >= 0 || h->kbmp >= 0;
+}
+
+static int bit(const u8 *r, u32 len, u32 b)
+{
+    return b / 8 < len && (r[b / 8] >> (b % 8)) & 1;
+}
+
+/* a report-protocol keyboard report -> the boot layout (modifiers, 0, six keys) */
+static void kbd_report_rep(struct hiddev *h, const u8 *r, u32 len)
+{
+    u8 boot[8];
+    int nk = 2;
+    u32 i;
+    if (h->kid) {
+        if (!len || r[0] != h->kid) return;     /* another report of the interface (media keys) */
+        r++;
+        len--;
+    }
+    memset(boot, 0, sizeof(boot));
+    if (h->kmod >= 0)
+        for (i = 0; i < 8; i++) if (bit(r, len, (u32)h->kmod + i)) boot[0] |= (u8)(1 << i);
+    if (h->karr >= 0) {
+        for (i = 0; i < h->karrn && nk < 8; i++) {
+            u32 o = (u32)h->karr + i * h->karrsz;
+            u8 u;
+            if ((o + h->karrsz) / 8 > len) break;
+            u = r[o / 8];
+            if (u >= 0xE0 && u <= 0xE7) boot[0] |= (u8)(1 << (u - 0xE0));
+            else if (u) boot[nk++] = u;
+        }
+    }
+    if (h->kbmp >= 0) {
+        for (i = 0; i < h->kbmpn; i++) {
+            u32 u = h->kbmpmin + i;
+            if (!bit(r, len, (u32)h->kbmp + i)) continue;
+            if (u >= 0xE0 && u <= 0xE7) boot[0] |= (u8)(1 << (u - 0xE0));
+            else if (u > 3 && u < 0x100 && nk < 8) boot[nk++] = (u8)u;
+        }
+    }
+    kbd_report(h, boot);
 }
 
 /* ---- report descriptor parser (mouse fields) ---- */
@@ -365,6 +492,18 @@ static int hid_probe(struct usb_dev *d, u8 *ifc, u8 *end)
     if (kind == 3) {
         /* set up above */
     } else if (kind == 1) {
+        /* boot subclass: the boot layout; else the layout of the report descriptor (several
+           reports with ids, N-key rollover bitmaps): a report id byte read as the modifier
+           byte would hold Shift (id 2) for good */
+        if (ifc[6] != 1 && rdlen > 0 && parse_kbd(h, rd, rdlen)) {
+            h->krep = 1;
+            kprintf("usb: keyboard report protocol%s%s, id %u\n", h->karr >= 0 ? ", key array" : "",
+                    h->kbmp >= 0 ? ", key bitmap" : "", h->kid);
+        } else if (ifc[6] != 1) {
+            kfree(h);
+            if (rd) kfree(rd);
+            return -1;
+        }
         if (ifc[6] == 1) usb_control(d, 0x21, 0x0B, 0, ifc[2], NULL, 0);    /* SET_PROTOCOL(boot) */
         usb_control(d, 0x21, 0x0A, 0, ifc[2], NULL, 0);                      /* SET_IDLE(0) */
         d->driver = UD_KBD;

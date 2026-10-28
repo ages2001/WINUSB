@@ -3,8 +3,16 @@
    USB device (under the controller: Device Manager sorts them into their classes by the
    compatible ids below and the WINUSB INF files) and per NVMe namespace. */
 #include "pnpint.h"
+#include "../inc/wdmbr.h"
 
 int usb_api(struct winapireq *r, u8 *buf);
+extern int usb_wdm_on;
+u32 wb_attach(struct wbops *o);
+int wb_list(struct wbfunc *out, int max);
+int wb_desc(u32 h, int type, int index, void *buf, int len);
+void wb_queue(struct wbreq *r);
+void wb_cancel(struct wbreq *r);
+u32 wb_frame(u32 h);
 
 int pkg_enumerates(void)
 {
@@ -95,7 +103,7 @@ const char *pkg_desc(u32 bdf)
     case 0x0C0310: return "WINUSB USB 1.1 OHCI Open Host Controller";
     case 0x0C0320: return "WINUSB USB 2.0 EHCI Enhanced Host Controller";
     case 0x0C0330: return "WINUSB USB 3.x xHCI eXtensible Host Controller";
-    case 0x0C0340: return "WINUSB USB4 Host Router (Thunderbolt 4)";
+    case 0x0C0340: return "WINUSB USB4 Host Router (Thunderbolt 4 / 5)";
     case 0x0C8000: return vid == 0x8086 ? "WINUSB Intel LPSS I2C Controller (HID over I2C)" : NULL;
     case 0x010802: return "WINUSB NVMe (NVM Express) Controller";
     default:
@@ -119,6 +127,8 @@ static struct winusbnode *tree_find(struct winusbnode *t, int n, u16 id)
         if (t[i].id == id) return &t[i];
     return NULL;
 }
+
+static void create_node(struct winusbnode *t, int n, struct winusbnode *d);
 
 /* compatible ids by function, the most precise first; each has its own INF entry (and class):
    USB hubs and other devices: WINUSB.INF (Universal Serial Bus controllers), keyboards
@@ -169,6 +179,12 @@ static void instance_of(struct winusbnode *t, int n, struct winusbnode *d, char 
 }
 
 static void create_child(struct winusbnode *t, int n, struct winusbnode *d)
+{
+    if (d->driver == UD_WDM) return;    /* a devnode of WINUSBW.SYS (the WDM bridge) */
+    create_node(t, n, d);
+}
+
+static void create_node(struct winusbnode *t, int n, struct winusbnode *d)
 {
     struct pnode *parent = NULL, *p;
     char inst[48], id[160], hw[160], desc[80];
@@ -226,7 +242,7 @@ static int same_nocase(const char *a, const char *b)
 static void ps2_adopt_node(u32 dn)
 {
     static const char loader[] = "WINUSB.VXD";
-    static const char drvdesc[] = "WINDRV WINUSB 1.0 PS/2 mouse";
+    static const char drvdesc[] = "WINDRV WINUSB 1.1 PS/2 mouse";
     char buf[64];
     u32 len = sizeof(buf) - 1;
     memset(buf, 0, sizeof(buf));
@@ -265,6 +281,63 @@ static void ps2_adopt(void)
     if (cm_locate_devnode(&root, NULL, 0) == CR_SUCCESS) ps2_adopt_tree(root, 0);
 }
 
+/* the devnode of the WDM bus driver WINUSBW.SYS (Windows 98 / ME), under the first USB
+   controller: the devices WINUSB has no class driver for are its children */
+static void sync_wdm(struct winusbnode *t, int n)
+{
+    struct pnode *parent = NULL;
+    int i;
+    if (!usb_wdm_on) return;
+    for (i = 0; i < n && !parent; i++)
+        if (t[i].type == UN_HC) parent = pnp_node_by_bdf(t[i].pciloc);
+    if (parent) pnp_child(parent, "WINUSB\\WDMBUS\\BRIDGE", "WINUSB\\WDMBUS", NULL,
+                          "WINUSB USB WDM Bridge (Windows drivers of USB devices)", PK_CHILD, 0);
+}
+
+/* ---- services of the WDM bridge for WINUSBW.SYS (vxdent.asm service table) ---- */
+u32 __cdecl svc_wb_attach(struct wbops *o)
+{
+    u32 f = irq_save(), r = wb_attach(o);
+    irq_restore(f);
+    return r;
+}
+
+int __cdecl svc_wb_list(struct wbfunc *out, int max)
+{
+    u32 f = irq_save();
+    int r = wb_list(out, max);
+    irq_restore(f);
+    return r;
+}
+
+int __cdecl svc_wb_desc(u32 h, int type, int index, void *buf, int len)
+{
+    u32 f = irq_save();
+    int r = wb_desc(h, type, index, buf, len);
+    irq_restore(f);
+    return r;
+}
+
+void __cdecl svc_wb_queue(struct wbreq *r)
+{
+    wb_queue(r);
+}
+
+void __cdecl svc_wb_cancel(struct wbreq *r)
+{
+    wb_cancel(r);
+}
+
+u32 __cdecl svc_wb_frame(u32 h)
+{
+    return wb_frame(h);
+}
+
+void __cdecl svc_wb_log(const char *s)
+{
+    kprintf("wdm: %s\n", s);
+}
+
 void pkg_sync(void)
 {
     struct winapireq rq;
@@ -284,6 +357,7 @@ void pkg_sync(void)
         return;
     }
     n = (int)(rq.retlen / sizeof(*t));
+    sync_wdm(t, n);
     for (i = 0; i < n; i++) {
         struct pnode *p;
         if (t[i].type != UN_DEV) continue;

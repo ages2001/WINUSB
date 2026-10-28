@@ -125,10 +125,17 @@ static void fu_set(struct ua *u, u8 fu, u8 ctl, u8 ch, s16 v, int bytes)
     ac_req(u, 0x21, 0x01, (u16)(((u16)ctl << 8) | ch), fu, b, (u16)bytes);
 }
 
-/* 0..65535 -> dB: the top 60 dB of the range, 0 = mute */
-static s16 to_db(u32 v, s16 mn, s16 mx)
+/* 0..65535 -> dB (1/256): the volume (master) is linear in amplitude, the recording gain
+   spreads over the top 60 dB of the range */
+static s16 to_db(u32 v, s16 mn, s16 mx, int amp)
 {
-    s32 range = (s32)mx - mn;
+    s32 range = (s32)mx - mn, d;
+    if (amp) {
+        u32 a = aeng_att_cdb(v);
+        if (a == 0xFFFFFFFFUL) return mn;
+        d = (s32)mx - (s32)((a * 256UL) / 100);
+        return (s16)(d < mn ? mn : d);
+    }
     if (range > 60 * 256) range = 60 * 256;
     return (s16)((s32)mx - (s32)(((u32)(65535 - v) * (u32)range) / 65535));
 }
@@ -145,10 +152,10 @@ static void ua_set_vol(struct adev *a, int ctl, u32 lr)
     if (f->mute != 0xFF) fu_set(u, f->id, 1, f->mute, (s16)(!l && !r), 1);
     if (f->vol == 0xFF) return;
     if (f->vol == 0) {
-        fu_set(u, f->id, 2, 0, to_db(MAX(l, r), u->vmin[k], u->vmax[k]), 2);
+        fu_set(u, f->id, 2, 0, to_db(MAX(l, r), u->vmin[k], u->vmax[k], k == 0), 2);
     } else {
-        fu_set(u, f->id, 2, f->vol, to_db(l, u->vmin[k], u->vmax[k]), 2);
-        if (f->vol2 != 0xFF) fu_set(u, f->id, 2, f->vol2, to_db(r, u->vmin[k], u->vmax[k]), 2);
+        fu_set(u, f->id, 2, f->vol, to_db(l, u->vmin[k], u->vmax[k], k == 0), 2);
+        if (f->vol2 != 0xFF) fu_set(u, f->id, 2, f->vol2, to_db(r, u->vmin[k], u->vmax[k], k == 0), 2);
     }
 }
 

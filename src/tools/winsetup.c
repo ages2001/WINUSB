@@ -90,8 +90,8 @@ static const struct { const char *name; int need, pkgs; } pkgfiles[] = {
     { "WINUSB.VXD", 0, P_USB }, { "WINUSB.PDR", 0, P_USB }, { "WINUSB.INF", 0, P_USB },
     { "WINUSBD.INF", 0, P_USB }, { "WINUSBH.INF", 0, P_USB }, { "WINUSBA.INF", 0, P_USB },
     { "WINUSBV.INF", 0, P_USB }, { "WINUSBS.INF", 0, P_USB }, { "WINKBD.INF", 0, P_USB },
-    { "WINMOU.INF", 0, P_USB }, { "WINDRVCI.DLL", 0, P_USB },
-    { "OEMSETUP.INF", 0, P_USB }, { "WINSOUND.DRV", 0, P_USB | P_AUD }, { "WINMIX.EXE", 0, P_USB | P_AUD },
+    { "WINMOU.INF", 0, P_USB }, { "WINDRVCI.DLL", 0, P_USB }, { "WINUSBW.SYS", 0, P_USB },
+    { "USBD.SYS", 0, P_USB }, { "OEMSETUP.INF", 0, P_USB }, { "WINSOUND.DRV", 0, P_USB | P_AUD }, { "WINMIX.EXE", 0, P_USB | P_AUD },
     { "AUDTEST.EXE", 0, P_USB | P_AUD }, { "WINBEEP.DRV", 0, P_USB | P_AUD },
 #elif defined(WIN_AUDIO)
     { "WINAUDIO.SYS", 1, P_AUD }, { "WINACORE.BIN", 1, P_AUD }, { "WINAUDIO.386", 1, P_AUD },
@@ -319,6 +319,46 @@ static int dos7(void)
     r.h.al = 0;
     int86(0x21, &r, &r);
     return r.h.al >= 7;
+}
+
+/* Windows 95/98/ME installed: MS-DOS 7 / 8 whose MSDOS.SYS names a Windows directory with
+   SYSTEM\VMM32.VXD in it. Plain MS-DOS 7.x / 8.0 (with or without Windows 3.x) and FreeDOS:
+   the DOS drivers go to CONFIG.SYS like on MS-DOS 6. */
+static int win9x_installed(void)
+{
+    static int known = -1;
+    union REGS r;
+    char f[16], line[160], vmm[200];
+    FILE *fp;
+    if (known >= 0) return known;
+    known = 0;
+    if (win9x_box) return known = 1;
+    if (!dos7()) return 0;
+    r.x.ax = 0x3000;
+    int86(0x21, &r, &r);
+    if (r.h.bh == 0xFD) return 0;                   /* FreeDOS */
+    r.x.ax = 0x3305;
+    int86(0x21, &r, &r);
+    sprintf(f, "%c:\\MSDOS.SYS", 'A' + r.h.dl - 1);
+    fp = fopen(f, "r");
+    if (!fp) return 0;
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line, *e;
+        while (*p == ' ' || *p == '\t') p++;
+        if (strnicmp(p, "WinDir", 6)) continue;
+        p += 6;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p++ != '=') continue;
+        while (*p == ' ' || *p == '\t') p++;
+        for (e = p; *e && *e != '\r' && *e != '\n' && *e != ' '; e++) ;
+        *e = 0;
+        if (!*p || strlen(p) > 150) continue;
+        sprintf(vmm, "%s%sSYSTEM\\VMM32.VXD", p, p[strlen(p) - 1] == '\\' ? "" : "\\");
+        if (exists(vmm)) known = 1;
+        break;
+    }
+    fclose(fp);
+    return known;
 }
 #endif
 
@@ -666,7 +706,8 @@ static int is_section(const char *ln)
 
 #ifndef UNINST
 #ifndef WIN_UDF
-/* drivers that WINDISK/WINUSB must follow: XMS and memory managers (and WINDISK for WINUSB) */
+/* drivers that WINDISK/WINUSB/WINAUDIO must follow: XMS and memory managers (WINDISK for WINUSB,
+   WINUSB for WINAUDIO) */
 static int is_anchor(const char *ln)
 {
     static const char *const after[] = {
@@ -674,6 +715,9 @@ static int is_anchor(const char *ln)
         "JEMMEX.EXE", "QEMM386.SYS", "386MAX.SYS",
 #ifdef WIN_USB
         "WINDISK.SYS",
+#endif
+#ifdef WIN_AUDIO
+        "WINUSB.SYS",           /* the sound bridge: WINUSB.SYS is there when WINAUDIO.SYS starts */
 #endif
         NULL
     };
@@ -710,6 +754,14 @@ static int cfg_install(const char *cfg, const char *dir, const char *uopts)
     }
     if (uopts)
         strcpy(opts, uopts);
+#ifdef WIN_AUDIO
+    for (i = 0; i < t->n; i++)
+        if (dev_line(t->l[i], "EMM386.EXE", NULL, NULL)) {
+            warn("%s: with EMM386 loaded, DOS programs get no Sound Blaster emulation outside Windows;"
+                 " without EMM386 WINAUDIO.SYS traps the ports itself (V86 monitor, DPMI, VCPI)", cfg);
+            break;
+        }
+#endif
     sprintf(line, "DEVICE=%s\\%s%s%s", dir, SYSFILE, *opts ? " " : "", opts);
     if (old)
         printf("  replacing the existing %s line%s\n", SYSFILE, old > 1 ? "s" : "");
@@ -810,7 +862,9 @@ static int cfg_remove(const char *cfg, char *dir)
 
 /* ---------------------------------------------------------------- Windows installations */
 
-/* Windows 95/98/ME: what goes where. 11 = SYSTEM, 12 = SYSTEM\IOSUBSYS, 17 = INF */
+/* Windows 95/98/ME: what goes where. 11 = SYSTEM, 12 = SYSTEM\IOSUBSYS, 13 = SYSTEM32\DRIVERS
+   (WDM drivers), 14 = SYSTEM32\DRIVERS when not there yet (never removed: Windows' own may be
+   the one there), 17 = INF */
 struct w9xfile { const char *name; int where; };
 static const struct w9xfile w9xfiles[] = {
 #ifdef WIN_USB
@@ -818,7 +872,7 @@ static const struct w9xfile w9xfiles[] = {
     { "WINWHEEL.EXE", 11 }, { "USBTREE.EXE", 11 }, { "WINCAM.EXE", 11 }, { "WINMIX.EXE", 11 },
     { "WINDRVCI.DLL", 11 }, { "WINUSB.INF", 17 }, { "WINUSBD.INF", 17 }, { "WINUSBH.INF", 17 },
     { "WINUSBA.INF", 17 }, { "WINUSBV.INF", 17 }, { "WINUSBS.INF", 17 }, { "WINKBD.INF", 17 },
-    { "WINMOU.INF", 17 },
+    { "WINMOU.INF", 17 }, { "WINUSBW.SYS", 13 }, { "USBD.SYS", 14 },
 #elif defined(WIN_AUDIO)
     { "WINAUDIO.VXD", 11 }, { "WINSOUND.DRV", 11 }, { "WINMIX.EXE", 11 }, { "AUDTEST.EXE", 11 },
     { "WINAUDIO.INF", 17 }, { "WINAUDM.INF", 17 },
@@ -836,7 +890,8 @@ static const struct w9xfile w9xfiles[] = {
 
 static void w9x_path(char *out, const char *win, int where, const char *name)
 {
-    sprintf(out, "%s\\%s\\%s", win, where == 12 ? "SYSTEM\\IOSUBSYS" : where == 17 ? "INF" : "SYSTEM", name);
+    sprintf(out, "%s\\%s\\%s", win, where == 12 ? "SYSTEM\\IOSUBSYS" : (where == 13 || where == 14) ? "SYSTEM32\\DRIVERS" :
+            where == 17 ? "INF" : "SYSTEM", name);
 }
 
 #ifdef UNINST
@@ -876,6 +931,7 @@ struct winst {
     unsigned ver;
     char mme;               /* 3.0 with Multimedia Extensions */
     char wfw;               /* Windows for Workgroups 3.11 */
+    char se;                /* Windows 98 Second Edition */
 };
 
 static struct winst wins[MAXWIN];
@@ -907,6 +963,41 @@ static unsigned ne_version(const char *path)
     return v;
 }
 
+/* version (major << 8 | minor) of the VS_FIXEDFILEINFO in the version resource of a
+   file, 0 if there is none: USER.EXE of Windows 98 and ME still says 4.0 in its NE header */
+static unsigned fv_build;           /* build number of the last file_version */
+static unsigned file_version(const char *path)
+{
+    static unsigned char b[4096 + 16];
+    unsigned keep = 0, n, i, v = 0;
+    FILE *fp = fopen(path, "rb");
+    if (!fp)
+        return 0;
+    for (;;) {
+        n = fread(b + keep, 1, 4096, fp);
+        if (!n)
+            break;
+        n += keep;
+        for (i = 0; i + 16 <= n; i++) {
+            if (b[i] == 0xBD && b[i + 1] == 0x04 && b[i + 2] == 0xEF && b[i + 3] == 0xFE) {
+                /* dwSignature, dwStrucVersion, dwFileVersionMS: major in the high word */
+                unsigned major = b[i + 10] | (b[i + 11] << 8), minor = b[i + 8] | (b[i + 9] << 8);
+                if (major && major < 16 && minor < 256) {
+                    v = (major << 8) | minor;
+                    fv_build = b[i + 12] | (b[i + 13] << 8);
+                }
+                break;
+            }
+        }
+        if (v || n < 16)
+            break;
+        keep = 15;
+        memmove(b, b + n - keep, keep);
+    }
+    fclose(fp);
+    return v;
+}
+
 /* the Windows version installed in 'dir'; 0 = none */
 static int win_probe(const char *dir, struct winst *w)
 {
@@ -919,7 +1010,10 @@ static int win_probe(const char *dir, struct winst *w)
         if (strlen(dir) + 20 > PMAX)
             return 0;
         sprintf(f, "%s\\SYSTEM\\USER.EXE", dir);
-        v = ne_version(f);
+        fv_build = 0;
+        v = file_version(f);
+        if (v < 0x0300)
+            v = ne_version(f);
         if (v == 0x0300) {
             w->ver = WV_30;
             sprintf(f, "%s\\SYSTEM\\MMSYSTEM.DLL", dir);
@@ -932,6 +1026,7 @@ static int win_probe(const char *dir, struct winst *w)
             w->ver = WV_95;
         } else if (v >= 0x040A && v < 0x045A) {
             w->ver = WV_98;
+            w->se = (char)(fv_build >= 2222);
         } else if (v >= 0x045A && v < 0x0500) {
             w->ver = WV_ME;
         } else {
@@ -958,7 +1053,7 @@ static const char *win_name(const struct winst *w)
     case WV_30:  return w->mme ? "Windows 3.0 with Multimedia Extensions" : "Windows 3.0";
     case WV_31:  return w->wfw ? "Windows for Workgroups 3.11" : "Windows 3.1";
     case WV_95:  return "Windows 95";
-    case WV_98:  return "Windows 98";
+    case WV_98:  return w->se ? "Windows 98 Second Edition" : "Windows 98";
     case WV_ME:  return "Windows ME";
     }
     return "Windows";
@@ -1737,6 +1832,7 @@ static void drv_remove(TEXT *t, const char *unused)
     }
     ini_del(t, "drivers.desc", SNDDRV);
     ini_del_sec(t, SNDSEC);
+    ini_del_sec(t, "winsound.drv");
 }
 #endif
 
@@ -2206,9 +2302,37 @@ static void dev_remove(TEXT *t, const char *name)
         }
 }
 #endif
+#ifdef WIN_USB
+/* IOS.INI [SafeList]: WINUSB.SYS is a real-mode driver the I/O Supervisor need not keep
+   (WINUSB.VXD and its port driver serve the USB disks in Windows; the DOS drive letters of
+   WINUSB.SYS are hidden while Windows runs). Without the entry Windows warns about a "new
+   MS-DOS driver" and puts its drives into MS-DOS compatibility mode. */
+#define IOSNAME "winusb.sys"
+static int safelist_line(const char *ln)
+{
+    const char *p = skipws(ln);
+    return !strnicmp(p, IOSNAME, strlen(IOSNAME)) && (SP(p[strlen(IOSNAME)]) || p[strlen(IOSNAME)] == ';' || !p[strlen(IOSNAME)]);
+}
+
+#ifdef UNINST
+static void ios_remove(TEXT *t, const char *unused)
+{
+    int h = ini_sec(t, "SafeList"), i;
+    (void)unused;
+    if (h < 0)
+        return;
+    for (i = h + 1; i < t->n && !is_section(t->l[i]); i++)
+        if (safelist_line(t->l[i])) {
+            t_del(t, i);
+            printf("  IOS.INI: " IOSNAME " removed from [SafeList]\n");
+            return;
+        }
+}
+#endif
+#endif
 #ifndef UNINST
 #if defined(WIN_USB) || defined(WIN_AUDIO)
-/* [drivers] wave= and midi= of SYSTEM.INI: WINSOUND.DRV finds the VxD by itself */
+/* [drivers] wave=, midi= and mixer= of SYSTEM.INI: WINSOUND.DRV finds the VxD by itself */
 static void drv9x_install(TEXT *t, const char *unused)
 {
     char cur[VMAX];
@@ -2217,10 +2341,13 @@ static void drv9x_install(TEXT *t, const char *unused)
         ini_set(t, SNDSEC, "wave", cur);
     if (ini_find(t, "drivers", "midi", cur) >= 0 && cur[0] && stricmp(cur, SNDDRV))
         ini_set(t, SNDSEC, "midi", cur);
+    if (ini_find(t, "drivers", "mixer", cur) >= 0 && cur[0] && stricmp(cur, SNDDRV))
+        ini_set(t, SNDSEC, "mixer", cur);
     ini_set(t, "drivers", "wave", SNDDRV);
     ini_set(t, "drivers", "midi", SNDDRV);
+    ini_set(t, "drivers", "mixer", SNDDRV);
     ini_set(t, "drivers.desc", SNDDRV, SNDDESC);
-    printf("  [drivers] wave=%s midi=%s\n", SNDDRV, SNDDRV);
+    printf("  [drivers] wave=%s midi=%s mixer=%s\n", SNDDRV, SNDDRV, SNDDRV);
 }
 #endif
 
@@ -2284,6 +2411,24 @@ static int inf_copy(const char *src, const char *dst)
     return bad ? -1 : 0;
 }
 
+#ifdef WIN_USB
+static void ios_install(TEXT *t, const char *unused)
+{
+    int h = ini_sec(t, "SafeList"), i;
+    (void)unused;
+    if (h < 0) {
+        t_ins(t, 0, "[SafeList]");
+        h = 0;
+    }
+    for (i = h + 1; i < t->n && !is_section(t->l[i]); i++)
+        if (safelist_line(t->l[i]))
+            return;
+    t_ins(t, h + 1, IOSNAME "      ; WINDRV: WINUSB.VXD serves the USB disks in Windows");
+    printf("  IOS.INI: " IOSNAME " added to [SafeList]\n");
+}
+
+#endif
+
 static int w9x_install(const struct winst *w, const char *dir)
 {
     char src[PMAX], dst[PMAX];
@@ -2293,6 +2438,14 @@ static int w9x_install(const struct winst *w, const char *dir)
         if (!exists(src))
             continue;
         w9x_path(dst, w->dir, w9xfiles[i].where, w9xfiles[i].name);
+        if (w9xfiles[i].where == 14 && exists(dst)) continue;
+        if (w9xfiles[i].where == 13 || w9xfiles[i].where == 14) {
+            char d2[PMAX];
+            sprintf(d2, "%s\\SYSTEM32", w->dir);
+            mkdir(d2);
+            strcat(d2, "\\DRIVERS");
+            mkdir(d2);
+        }
         if (w9xfiles[i].where == 17) {
             if (inf_copy(src, dst)) {
                 printf("  Cannot write %s\n", dst);
@@ -2307,7 +2460,12 @@ static int w9x_install(const struct winst *w, const char *dir)
         }
         n++;
     }
-    printf("  %d files -> %s\\SYSTEM, SYSTEM\\IOSUBSYS and INF\n", n, w->dir);
+    printf("  %d files -> %s\\SYSTEM, SYSTEM\\IOSUBSYS%s and INF\n", n, w->dir,
+#ifdef WIN_USB
+           (w->ver >= 0x040A) ? ", SYSTEM32\\DRIVERS" : "");
+#else
+           "");
+#endif
 #ifdef WIN_AUDIO
     {
         int k;
@@ -2322,6 +2480,8 @@ static int w9x_install(const struct winst *w, const char *dir)
     if (later)
         printf("  %d of them are in use and get replaced at the next start of Windows (WININIT.INI)\n", later);
 #ifdef WIN_USB
+    if (ini_edit(w->dir, "IOS.INI", ios_install, NULL))
+        return -1;
     if (ini_edit(w->dir, "SYSTEM.INI", sys_install, NULL))
         return -1;
     join(src, dir, "WINWHEEL.EXE");
@@ -2386,9 +2546,16 @@ static void drv9x_remove(TEXT *t, const char *unused)
         else
             ini_del(t, "drivers", "midi");
     }
+    if (ini_find(t, "drivers", "mixer", cur) >= 0 && !stricmp(cur, SNDDRV)) {
+        if (ini_find(t, SNDSEC, "mixer", old) >= 0 && old[0])
+            ini_set(t, "drivers", "mixer", old);
+        else
+            ini_del(t, "drivers", "mixer");
+    }
     ini_del(t, "drivers.desc", SNDDRV);
     ini_del_sec(t, SNDSEC);
-    printf("  [drivers] wave= and midi= restored\n");
+    ini_del_sec(t, "winsound.drv");
+    printf("  [drivers] wave=, midi= and mixer= restored\n");
 }
 #endif
 
@@ -2407,6 +2574,7 @@ static int w9x_remove(const struct winst *w)
         return -1;
     if (ini_edit(w->dir, "WIN.INI", win_remove, NULL))
         return -1;
+    ini_edit(w->dir, "IOS.INI", ios_remove, NULL);
 #endif
 #if defined(WIN_USB) || defined(WIN_AUDIO)
     if (ini_edit(w->dir, "SYSTEM.INI", drv9x_remove, NULL))
@@ -2425,6 +2593,7 @@ static int w9x_remove(const struct winst *w)
         return -1;
 #endif
     for (i = 0; w9xfiles[i].name; i++) {
+        if (w9xfiles[i].where == 14) continue;          /* USBD.SYS: Windows' drivers need it */
         w9x_path(f, w->dir, w9xfiles[i].where, w9xfiles[i].name);
         /* files shared with another package while its VxD is installed */
         if (!stricmp(w9xfiles[i].name, "WIN4G.VXD") ? w9x_other(w->dir, P_DISK | P_USB | P_AUD) :
@@ -2440,6 +2609,93 @@ static int w9x_remove(const struct winst *w)
 #endif
     printf("  %d files deleted\n", n);
     return 0;
+}
+#endif
+#endif
+
+#ifdef WIN_AUDIO
+/* ---- SET BLASTER in AUTOEXEC.BAT: the settings of the emulated Sound Blaster 16 for DOS
+   programs (DOS, and the MS-DOS boxes of every Windows) ---- */
+#define SBMARK "BLASTER.WNA"
+static int is_blaster(const char *ln)
+{
+    const char *p = skipws(ln);
+    if (strnicmp(p, "SET", 3) || !SP(p[3])) return 0;
+    p = skipws(p + 3);
+    return !strnicmp(p, "BLASTER", 7) && (p[7] == '=' || SP(p[7]));
+}
+
+#ifndef UNINST
+static int blaster_install(const char *dir, const char *opts)
+{
+    TEXT *t;
+    char f[PMAX], line[80];
+    unsigned a = 0x220, irq = 5, d = 1, h = 5, mpu = 0x330;
+    const char *o = opts ? opts : "";
+    FILE *fp;
+    int i, r;
+    for (; *o; o++) {
+        if (!strnicmp(o, "/NOSB", 5)) return 0;
+        if (!strnicmp(o, "/SB:", 4)) {
+            const char *q;
+            for (q = o + 4; *q && !SP(*q) && *q != '/'; q++) {
+                char c = (char)toupper(*q);
+                unsigned long v = strtoul(q + 1, NULL, c == 'A' || c == 'P' ? 16 : 10);
+                if (c == 'A') a = (unsigned)v;
+                else if (c == 'I') irq = (unsigned)v;
+                else if (c == 'D') d = (unsigned)v;
+                else if (c == 'H') h = (unsigned)v;
+                else if (c == 'P') mpu = (unsigned)v;
+            }
+        }
+    }
+    sprintf(f, "%c:\\AUTOEXEC.BAT", bootdrv);
+    t = t_new();
+    r = t_load(t, f);
+    if (r < 0) {
+        t_free(t);
+        printf("  Cannot read %s\n", f);
+        return 0;
+    }
+    for (i = 0; i < t->n; i++)
+        if (is_blaster(t->l[i])) {
+            printf("  %s: keeping %s\n", f, skipws(t->l[i]));
+            t_free(t);
+            return 0;
+        }
+    if (mpu) sprintf(line, "SET BLASTER=A%X I%u D%u H%u P%X T6", a, irq, d, h ? h : d, mpu);
+    else sprintf(line, "SET BLASTER=A%X I%u D%u H%u T6", a, irq, d, h ? h : d);
+    i = (t->n && !strnicmp(skipws(t->l[0]), "@ECHO", 5)) ? 1 : 0;
+    t_ins(t, i, line);
+    printf("  %s: %s (Sound Blaster emulation)\n", f, line);
+    r = t_save(t, f);
+    t_free(t);
+    join(f, dir, SBMARK);
+    if ((fp = fopen(f, "wb")) != NULL) fclose(fp);
+    return r;
+}
+#else
+static int blaster_remove(const char *dir)
+{
+    TEXT *t;
+    char f[PMAX];
+    int i, r = 0;
+    if (!dir[0]) return 0;
+    join(f, dir, SBMARK);
+    if (!exists(f)) return 0;
+    remove(f);
+    sprintf(f, "%c:\\AUTOEXEC.BAT", bootdrv);
+    t = t_new();
+    if (t_load(t, f) == 0)
+        for (i = 0; i < t->n; i++)
+            if (is_blaster(t->l[i])) {
+                printf("  %s: removing: %s\n", f, t->l[i]);
+                t_del(t, i);
+                r = t_save(t, f);
+                break;
+            }
+    t_free(t);
+    return r;
 }
 #endif
 #endif
@@ -2824,8 +3080,8 @@ static int udf_dos_install(const char *dir, const char *opts)
     char f[PMAX], cfg[PMAX];
     FILE *fp;
     int i, r;
-    if (dos7() || win9x_box) {
-        printf("MS-DOS 7: " SYSFILE " goes to DOSSTART.BAT (MS-DOS mode), Windows gets WINUDF.VXD\n");
+    if (win9x_installed()) {
+        printf("Windows 95/98/ME: " SYSFILE " goes to DOSSTART.BAT (MS-DOS mode), Windows gets WINUDF.VXD\n");
         return 0;
     }
     sprintf(f, "%c:\\AUTOEXEC.BAT", bootdrv);
@@ -3054,10 +3310,14 @@ int main(int argc, char **argv)
     if (!nowin) {
         if (win_select(win, 1))
             return 1;
-        if (!nwins) {
-            printf("No Windows installation supported by " PKG " was found.\n"
-                   "Use /W:<windows directory>, or /NOWIN to install the DOS driver only.\n");
+        if (!nwins && win[0]) {
+            printf("No Windows installation supported by " PKG " was found in %s.\n", win);
             return 1;
+        }
+        if (!nwins) {
+            /* plain DOS: the DOS driver alone */
+            printf("No Windows installation found: the DOS driver only (/W:<windows directory> adds Windows).\n");
+            nowin = 1;
         }
     }
     if (!dir[0]) {
@@ -3121,8 +3381,8 @@ int main(int argc, char **argv)
 #else
     /* the DOS of Windows 95/98: Windows has the Plug and Play driver, the DOS driver is for
        DOS sessions only (/DOS); Windows ME has no CONFIG.SYS */
-    if (dos7() && !dosdrv) {
-        printf("MS-DOS 7: " SYSFILE " not added to CONFIG.SYS (Windows has the Plug and Play driver; /DOS adds it for DOS mode)\n");
+    if (win9x_installed() && !dosdrv) {
+        printf("Windows 95/98/ME: " SYSFILE " not added to CONFIG.SYS (Windows has the Plug and Play driver; /DOS adds it for DOS mode)\n");
     } else {
         if (cfg_install(cfg, dir, useropts ? opts : NULL))
             return 1;
@@ -3131,6 +3391,10 @@ int main(int argc, char **argv)
             return 1;
 #endif
     }
+#endif
+#ifdef WIN_AUDIO
+    if (blaster_install(dir, useropts ? opts : NULL))
+        return 1;
 #endif
     for (i = 0; !nowin && i < nwins; i++) {
         printf("%s (%s)\n", wins[i].dir, win_name(&wins[i]));
@@ -3227,6 +3491,10 @@ int main(int argc, char **argv)
         if (exists(f))
             strcpy(dir, own);
     }
+#ifdef WIN_AUDIO
+    if (blaster_remove(dir))
+        return 1;
+#endif
     inwin = 0;
     for (i = 0; i < nwins; i++)
         if (!stricmp(dir, wins[i].dir))

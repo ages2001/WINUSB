@@ -5,10 +5,16 @@
      - MessageBeep through the MIDI synthesizer of WINAUDIO.SYS / WINUSB.SYS
        (PC speaker when neither is loaded),
      - the voice API of the original SOUND.DRV (OpenSound, SetVoiceNote, StartSound, ...)
-       played on the synthesizer, four voices.
+       played on the synthesizer, four voices,
+     - in real mode, where the Multimedia Extensions do not run: the system sounds of
+       WIN.INI [sounds] (WAV files, start and exit sounds included) played by the driver.
    The music is timed by a SYSTEM.DRV timer; the core is called only from that timer. */
 #include <windows.h>
+#include <mmsystem.h>
+#include <string.h>
 #include "winapi.h"
+
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 DWORD WINAPI GlobalDosAlloc(DWORD cb);
 UINT WINAPI GlobalDosFree(UINT sel);
@@ -24,6 +30,7 @@ DWORD WINAPI GetSystemMSecCount(void);
 #define CH_BEEP      14          /* MIDI channel of MessageBeep */
 #define CH_NOISE     9           /* percussion */
 #define PROG_SQUARE  80          /* GM "Lead 1 (square)": the PC speaker sound */
+#define RQSIZE       1024        /* request block: request, device list at 64 */
 
 /* ---------------------------------------------------------------- core */
 
@@ -50,15 +57,18 @@ static void fmemset(void FAR *d, BYTE v, WORD n)
     while (n--) *p++ = v;
 }
 
-static int api_midi(DWORD msg)
+static int api(WORD fn, DWORD a0, DWORD a1, DWORD a2, DWORD buf)
 {
     WORD rseg = reqseg, mx = ((WORD)mplexes[core] << 8) | 1;
     DWORD ent = vxdentry;
     fmemset(rq, 0, sizeof(*rq));
-    rq->fn = WINF_AUD_MIDI;
+    rq->fn = fn;
     rq->status = 0xFFFF;
-    rq->arg0 = 0xFF;                /* the synthesizer */
-    rq->arg1 = msg;
+    rq->arg0 = a0;
+    rq->arg1 = a1;
+    rq->arg2 = a2;
+    rq->buf = buf;
+    rq->buflen = buf ? RQSIZE - 64 : 0;
     if (ent) {
         _asm {
             mov ax, 3
@@ -98,6 +108,11 @@ static int api_midi(DWORD msg)
         }
     }
     return rq->status;
+}
+
+static int api_midi(DWORD msg)
+{
+    return api(WINF_AUD_MIDI, 0xFF, msg, 0, 0);     /* 0xFF: the synthesizer */
 }
 
 /* finds WINAUDIO.SYS (else WINUSB.SYS) and its VxD */
@@ -143,7 +158,7 @@ static void find_core(void)
         }
     }
     if (core < 0) return;
-    r = GlobalDosAlloc(64);
+    r = GlobalDosAlloc(RQSIZE);
     if (!r) {
         core = -1;
         return;
@@ -337,6 +352,9 @@ static void music_tick(long dt)
 /* SYSTEM.DRV timer, interrupt time. The timer of Windows 3.0 may come only every 55 ms
    whatever rate is asked for: the time that really passed is used. */
 static DWORD last;
+static volatile BYTE wplaying, wdone;
+static int wav_fill(void);
+static void wav_stop(void);
 
 void __far __loadds __saveregs TimerTick(void)
 {
@@ -357,6 +375,7 @@ void __far __loadds __saveregs TimerTick(void)
         noise_note = -1;
     }
     if (core >= 0) flush_midi();
+    if (wplaying && wav_fill()) wav_stop();
     busy = 0;
 }
 
@@ -622,6 +641,181 @@ int WINAPI __loadds SetVoiceThreshold(int n, int notes)
     return 0;
 }
 
+/* ---------------------------------------------------------------- system sounds (WAV)
+   Where MMSYSTEM cannot run (real mode: the Multimedia Extensions are protected mode only)
+   the sounds of WIN.INI [sounds] are played here: the file is read into memory blocks, a
+   ring in conventional memory goes to the core like WINSOUND.DRV's rings, the timer keeps
+   it filled. The same for the start and exit sounds of the Multimedia Extensions. */
+#define WCHUNK      32768U
+#define WNCHUNK     16              /* at most 512 KB of sound */
+#define WRING       16384U
+
+static HGLOBAL wch[WNCHUNK];
+static WORD wnch;
+static DWORD wlen, wsent;           /* data bytes, bytes put into the ring */
+static WORD wringsel, wringseg, wsid, walign;
+
+static struct winring FAR *wring(void)
+{
+    return MK_FP(wringsel, 0);
+}
+
+/* more data into the ring (timer or caller); 1 when everything has been heard */
+static int wav_fill(void)
+{
+    struct winring FAR *r = wring();
+    BYTE FAR *d = (BYTE FAR *)r + 32;
+    while (wsent < wlen) {
+        DWORD space = WRING - (r->wr - r->rd);
+        WORD off = (WORD)(r->wr % WRING), n, co = (WORD)(wsent % WCHUNK), ci = (WORD)(wsent / WCHUNK);
+        BYTE FAR *src;
+        if (space < walign) break;
+        n = (WORD)MIN(space, wlen - wsent);
+        if (n > WRING - off) n = WRING - off;
+        if (n > WCHUNK - co) n = WCHUNK - co;
+        n -= n % walign;
+        if (!n) break;
+        src = (BYTE FAR *)GlobalLock(wch[ci]) + co;
+        _fmemcpy(d + off, src, n);
+        GlobalUnlock(wch[ci]);
+        r->wr += n;
+        wsent += n;
+    }
+    return wsent >= wlen && (long)(r->pos - r->wr) >= 0;
+}
+
+/* the playing sound ends; the memory is given back by wav_free (not at interrupt time) */
+static void wav_stop(void)
+{
+    if (!wplaying) return;
+    wplaying = 0;
+    api(WINF_AUD_CTL, wsid, AC_CLOSE, 0, 0);
+    wdone = 1;
+}
+
+static void wav_free(void)
+{
+    WORD i;
+    if (wplaying) {
+        busy++;
+        wav_stop();
+        busy--;
+    }
+    for (i = 0; i < wnch; i++) GlobalFree(wch[i]);
+    wnch = 0;
+    if (wringsel) GlobalDosFree(wringsel);
+    wringsel = 0;
+    wdone = 0;
+}
+
+static int rd(HFILE f, void FAR *p, WORD n)
+{
+    return _lread(f, p, n) == n;
+}
+
+/* plays a WAV file (PCM) through the first sound device of the core; 1 when it plays */
+static int wav_play(LPCSTR name)
+{
+    OFSTRUCT of;
+    HFILE f;
+    BYTE hdr[12];
+    PCMWAVEFORMAT fmt;
+    DWORD len = 0, ck[2], left;
+    int got_fmt = 0, dev = -1, i, nd;
+    struct winauddev FAR *dl;
+    DWORD r;
+    if (!name || !*name || core < 0) return 0;
+    wav_free();
+    f = OpenFile(name, &of, OF_READ | OF_SHARE_DENY_NONE);
+    if (f == HFILE_ERROR) return 0;
+    if (!rd(f, hdr, 12) || _fmemcmp(hdr, "RIFF", 4) || _fmemcmp(hdr + 8, "WAVE", 4)) goto bad;
+    for (;;) {
+        if (!rd(f, ck, 8)) goto bad;
+        if (ck[0] == 0x20746D66UL) {                    /* "fmt " */
+            if (ck[1] < 16 || !rd(f, &fmt, 16)) goto bad;
+            if (ck[1] > 16) _llseek(f, (ck[1] - 16 + 1) & ~1UL, 1);
+            got_fmt = 1;
+        } else if (ck[0] == 0x61746164UL) {             /* "data" */
+            len = ck[1];
+            break;
+        } else {
+            _llseek(f, (ck[1] + 1) & ~1UL, 1);
+        }
+    }
+    if (!got_fmt || fmt.wf.wFormatTag != WAVE_FORMAT_PCM || !fmt.wf.nBlockAlign ||
+        (fmt.wBitsPerSample != 8 && fmt.wBitsPerSample != 16) || !fmt.wf.nChannels || fmt.wf.nChannels > 2)
+        goto bad;
+    if (len > (DWORD)WNCHUNK * WCHUNK) len = (DWORD)WNCHUNK * WCHUNK;
+    len -= len % fmt.wf.nBlockAlign;
+    for (left = len; left && wnch < WNCHUNK; ) {
+        WORD n = (WORD)MIN(left, WCHUNK);
+        HGLOBAL h = GlobalAlloc(GMEM_FIXED, n);
+        void FAR *p;
+        if (!h) break;
+        wch[wnch++] = h;
+        p = GlobalLock(h);
+        n = _lread(f, p, n);
+        GlobalUnlock(h);
+        if (!n || n == (WORD)-1) break;
+        left -= n;
+    }
+    _lclose(f);
+    len -= left;
+    if (!len) goto none;
+    r = GlobalDosAlloc(WRING + 32);
+    if (!r) goto none;
+    wringsel = LOWORD(r);
+    wringseg = HIWORD(r);
+    fmemset(wring(), 0, 32);
+    wring()->magic = WINRING_MAGIC;
+    wring()->size = WRING;
+    walign = fmt.wf.nBlockAlign;
+    wlen = len;
+    wsent = 0;
+    busy++;
+    /* the first device that plays */
+    if (api(WINF_AUD_DEVS, 0, 0, 0, ((DWORD)reqseg << 16) | 64) == WINE_OK) {
+        nd = (int)(rq->retlen / sizeof(struct winauddev));
+        dl = MK_FP(reqsel, 64);
+        for (i = 0; i < nd && (64 + (i + 1) * (int)sizeof(*dl)) <= RQSIZE; i++)
+            if ((dl[i].caps & WINAC_OUT) && !dl[i].gone) {
+                dev = dl[i].id;
+                break;
+            }
+    }
+    if (dev >= 0 && api(WINF_AUD_OPEN, (DWORD)dev, fmt.wf.nSamplesPerSec,
+                        (DWORD)fmt.wBitsPerSample | ((DWORD)fmt.wf.nChannels << 8), (DWORD)wringseg << 16) == WINE_OK) {
+        wsid = (WORD)rq->retlen;
+        wav_fill();
+        api(WINF_AUD_CTL, wsid, AC_START, 0, 0);
+        wplaying = 1;
+    }
+    busy--;
+    if (!wplaying) goto none;
+    return 1;
+bad:
+    _lclose(f);
+none:
+    wav_free();
+    return 0;
+}
+
+/* the file of a [sounds] entry ("file" or "file,description") */
+static int sys_sound(LPCSTR key)
+{
+    char v[144];
+    int i;
+    GetProfileString("sounds", key, "", v, sizeof(v));
+    for (i = 0; v[i] && v[i] != ','; i++) ;
+    v[i] = 0;
+    /* (no USER functions here: USER loads this driver while it starts itself) */
+    if (!v[0] || ((v[0] | 0x20) == 'n' && (v[1] | 0x20) == 'o' && (v[2] | 0x20) == 'n' && (v[3] | 0x20) == 'e' && !v[4]))
+        return 0;
+    find_core();
+    if (!need_timer()) return 0;
+    return wav_play(v);
+}
+
 /* ---------------------------------------------------------------- MessageBeep */
 
 typedef BOOL (FAR PASCAL *SNDPLAY)(LPCSTR, UINT);
@@ -685,6 +879,12 @@ void WINAPI __loadds DoBeep(int type)
             if (sndplay(sysnames[k], 1 /* SND_ASYNC */)) return;
         }
     }
+    /* real mode (and no MMSYSTEM): the [sounds] files are played here */
+    if (type != -1 && (realmode || !sndplay)) {
+        int k = (type & 0xF0) >> 4;
+        if (k > 4) k = 0;
+        if (sys_sound(sysnames[k])) return;
+    }
     if (need_timer()) {
         static const BYTE notes[5] = { 78, 66, 81, 83, 85 };   /* 740 Hz like the speaker; others by icon */
         int k = type == -1 ? 0 : (type & 0xF0) >> 4;
@@ -709,7 +909,12 @@ void WINAPI __loadds Enable(void)
 {
     HINSTANCE u = GetModuleHandle("USER");
     realmode = !(GetWinFlags() & WF_PMODE);
-    if (realmode || (u && GetProcAddress(u, "OpenDriver")) || hmmsys) return;
+    if (realmode) {
+        /* the start sound of the Multimedia Extensions, which do not run in real mode */
+        sys_sound("SystemStart");
+        return;
+    }
+    if ((u && GetProcAddress(u, "OpenDriver")) || hmmsys) return;
     {
         OFSTRUCT of;
         HINSTANCE h;
@@ -726,6 +931,12 @@ void WINAPI __loadds Enable(void)
 
 void WINAPI __loadds Disable(void)
 {
+    if (realmode && sys_sound("SystemExit")) {
+        /* the exit sound is heard before Windows ends (at most 5 seconds) */
+        DWORD t0 = GetSystemMSecCount();
+        while (wplaying && GetSystemMSecCount() - t0 < 5000) ;
+    }
+    wav_free();
     if (timer) {
         KillSystemTimer(timer);
         timer = 0;

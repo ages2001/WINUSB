@@ -38,7 +38,7 @@ static int started;
 static volatile u32 ev_pending;
 #define EV_POLL  1
 #define EV_KEYS  2
-static u8 keyq[64];
+static u8 keyq[256];
 static volatile u32 keyq_head, keyq_tail;
 static u16 com_port;
 
@@ -47,7 +47,11 @@ static u32 mcb_sel, mcb_off;    /* PM callback in the system VM */
 static volatile s32 m_dx, m_dy, m_dz, m_dw;
 static volatile u32 m_buttons, m_last_buttons;
 static volatile u32 m_usb_buttons, m_ps2_buttons;
-static volatile u32 m_latch;    /* buttons pressed since the last delivery (short clicks) */
+/* button changes waiting for delivery: a click (or both clicks of a double click) between
+   two deliveries is delivered press by release, nothing is merged */
+#define MBQLEN 16
+static volatile u8 m_bq[MBQLEN];
+static volatile u32 m_bq_head, m_bq_tail, m_bq_last;
 static volatile u32 m_pending;
 static volatile u32 m_absx, m_absy, m_absnew;
 static u8 saved_client[0x6C];
@@ -116,6 +120,38 @@ void *plat_rm(u32 segoff)
     return (void *)(cur_high + ((segoff >> 16) << 4) + (segoff & 0xFFFF));
 }
 
+/* the sound bridge: Windows 95/98/ME through the other VxD's DDB, else (Windows 3.x with the
+   DOS drivers) the control blocks the DOS drivers linked */
+extern u32 vxd_link[2];
+u32 __cdecl vmm_get_ddb(u32 id);
+
+struct winbridge *plat_bridge_peer(void)
+{
+    struct winbridge *own = (struct winbridge *)((u8 *)cb + WIN_BROFF);
+#ifdef WIN_AUDIO
+    u32 id = WIN_VXD_USB;
+#else
+    u32 id = WIN_VXD_AUDIO;
+#endif
+    if (vmm_version() >= 0x400) {
+        u32 ddb = vmm_get_ddb(id);
+        if (ddb && ((u32 *)(ddb + 80))[0] == WINBR_MAGIC && ((u32 *)(ddb + 80))[1])
+            return (struct winbridge *)((u32 *)(ddb + 80))[1];
+    }
+    if (!own->peer) return NULL;
+    return (struct winbridge *)((u8 *)plat_sysrm(own->peer) + WIN_BROFF);
+}
+
+void *plat_bridge_ring(struct winbridge *p)
+{
+    return (void *)p->lin;
+}
+
+void plat_bridge_publish(struct winbridge *own)
+{
+    vxd_link[1] = (u32)own;
+}
+
 static volatile u32 lock_ms;    /* a lock key came from a USB keyboard at this time ... */
 static volatile int lock_on;    /* ... if set */
 #ifdef WIN_USB
@@ -129,11 +165,11 @@ void plat_key(const u8 *sc, int n)
     for (i = 0; i < n; i++)
         if ((sc[i] == 0x3A || sc[i] == 0x45 || sc[i] == 0x46) && !(i && (sc[i - 1] == 0xE0 || sc[i - 1] == 0x1D)))
             lock_ms = plat_ms(), lock_on = 1;
+    /* a whole key sequence or nothing (E0 prefixes, releases) */
+    if ((u32)n > (keyq_tail + sizeof(keyq) - keyq_head - 1) % sizeof(keyq)) return;
     while (n--) {
-        u32 nh = (keyq_head + 1) % sizeof(keyq);
-        if (nh == keyq_tail) break;
         keyq[keyq_head] = *sc++;
-        keyq_head = nh;
+        keyq_head = (keyq_head + 1) % sizeof(keyq);
     }
     if (!(ev_pending & EV_KEYS)) {
         ev_pending |= EV_KEYS;
@@ -148,7 +184,13 @@ static void mouse_event(int dx, int dy, int dz, int dw)
 {
     u32 nb = m_usb_buttons | m_ps2_buttons;
     m_dx += dx; m_dy += dy; m_dz += dz; m_dw += dw;
-    m_latch |= nb & ~m_buttons;
+    if (nb != m_bq_last) {
+        u32 nh = (m_bq_head + 1) % MBQLEN;
+        if (nh == m_bq_tail) m_bq_head = (m_bq_head + MBQLEN - 1) % MBQLEN, nh = (m_bq_head + 1) % MBQLEN;
+        m_bq[m_bq_head] = (u8)nb;
+        m_bq_head = nh;
+        m_bq_last = nb;
+    }
     m_buttons = nb;
     if (!mcb_sel || !sysvm) return;
     if (!m_pending) {
@@ -186,9 +228,17 @@ void vxd_ps2_mouse(int dx, int dy, int dz, int dw, int buttons)
     irq_restore(f);
 }
 
+#ifdef WIN_USB
+extern void (*kbc_kbd_sink)(const u8 *b, int n);
+static void vxd_kbd_sink(const u8 *b, int n);
+#endif
+
 void vxd_input_init(void)
 {
     if (!sysvm) sysvm = vmm_sys_vm();
+#ifdef WIN_USB
+    kbc_kbd_sink = vxd_kbd_sink;
+#endif
 }
 
 static int kbd_ps2;
@@ -197,6 +247,19 @@ void vxd_kbd_start(void)
 {
     kbd_ps2 = 1;
 }
+
+#ifdef WIN_USB
+/* keyboard bytes read while the 8042 served the mouse: to VKD like the USB keys (the
+   acknowledges of a keyboard command are no keys) */
+static void vxd_kbd_sink(const u8 *b, int n)
+{
+    u8 k[32];
+    int i, m = 0;
+    for (i = 0; i < n && m < (int)sizeof(k); i++)
+        if (b[i] != 0xFA && b[i] != 0xFE) k[m++] = b[i];
+    if (m) plat_key(k, m);
+}
+#endif
 
 int plat_irq_attach(int irq)
 {
@@ -332,10 +395,13 @@ void __cdecl vxd_vmevent(u32 vm, struct crs *c)
     for (;;) {
         f = irq_save();
         dx = m_dx; dy = m_dy; dz = m_dz; dw = m_dw;
-        /* a press released again before it was delivered is delivered first, the release
-           follows in the next round */
-        b = m_buttons | (m_latch & ~m_last_buttons);
-        m_latch = 0;
+        /* the next button change in order, with the motion so far */
+        if (m_bq_tail != m_bq_head) {
+            b = m_bq[m_bq_tail];
+            m_bq_tail = (m_bq_tail + 1) % MBQLEN;
+        } else {
+            b = m_last_buttons;
+        }
         m_dx = m_dy = m_dz = m_dw = 0;
         abs = m_absnew;
         m_absnew = 0;
@@ -418,15 +484,17 @@ void __cdecl vxd_pmapi(u32 vm, struct crs *c)
     case 1:
         vxd_input_init();
 #ifdef WIN_USB
-        /* Windows 95/98/ME: a PS/2 mouse whose devnode has Windows' driver (VMOUSE with
-           MSMOUSE.VXD) is taken over too when WINMOUSE.DRV is the mouse driver */
-        if (vmm_version() >= 0x400 && !ps2_status()) ps2_start(12);
+        /* the PS/2 mouse is taken when WINMOUSE.DRV is the mouse driver: Windows 3.x, and
+           Windows 95/98/ME with Windows' driver on its devnode (VMOUSE with MSMOUSE.VXD);
+           with another mouse driver it stays with that driver */
+        if (!ps2_status()) ps2_start(12);
         ps2_reclaim();
 #endif
         mcb_sel = c->ecx & 0xFFFF;
         mcb_off = c->edx & 0xFFFF;
         m_dx = m_dy = m_dz = m_dw = 0;
-        m_last_buttons = m_buttons;
+        m_bq_tail = m_bq_head;
+        m_bq_last = m_last_buttons = m_buttons;
         kprintf("vxd: mouse client %04lx:%04lx\n", mcb_sel, mcb_off);
         c->eax = 0;
         break;
@@ -1132,6 +1200,8 @@ static const struct optname optnames[] = {
     { "NOHDA", OPT_NOHDA, 0 }, { "NOAC97", OPT_NOAC97, 0 }, { "EAPD", OPT_INVEAPD, 0 }, { "NOGEN", OPT_NOGENERIC, 0 },
     { "IMM", OPT_HDAIMM, 0 }, { "NOSYNTH", OPT_NOSYNTH, 0 }, { "POSBUF", OPT_POSBUF, 0 }, { "GPIO", OPT_HDAGPIO, 0 },
     { "DSP", OPT2_DSP, 1 }, { "DMIC", OPT2_DMIC, 1 }, { "NODSP", OPT2_NODSP, 1 },
+    { "NOTPVOL", OPT2_NOTPVOL, 1 },
+    { "USBSB", OPT2_USBSB, 1 },
 #endif
     { NULL, 0, 0 }
 };
@@ -1144,6 +1214,20 @@ static void parse_options(const char *s)
     while (*s) {
         int n = 0, i;
         while (*s == ' ' || *s == '/' || *s == '-' || *s == '\t') s++;
+#ifdef WIN_AUDIO
+        if ((s[0] == 'S' || s[0] == 's') && (s[1] == 'B' || s[1] == 'b') && s[2] == ':') {
+            /* /SB:A220,I5,D1,H5,P330 */
+            char *d = ((struct winsb *)((u8 *)cb + WIN_SBOFF))->spec;
+            int k = 0;
+            s += 3;
+            while (*s && *s != ' ' && *s != '/' && *s != '\t') {
+                if (k < 23) d[k++] = *s;
+                s++;
+            }
+            d[k] = 0;
+            continue;
+        }
+#endif
         while (*s && *s != ' ' && *s != '/' && *s != '\t') {
             char ch = *s++;
             if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 32);
@@ -1157,6 +1241,14 @@ static void parse_options(const char *s)
             cb->slotreq = (u8)(v > 20 ? 20 : v);
             continue;
         }
+#ifdef WIN_AUDIO
+        {
+            struct winsb *sc = (struct winsb *)((u8 *)cb + WIN_SBOFF);
+            if (!strncmp(tok, "NOSB", 16)) { sc->flags |= SBF_OFF; continue; }
+            if (!strncmp(tok, "NOOPL", 16)) { sc->flags |= SBF_NOOPL; continue; }
+            if (!strncmp(tok, "NOMPU", 16)) { sc->flags |= SBF_NOMPU; continue; }
+        }
+#endif
         for (i = 0; optnames[i].name; i++) {
             if (strncmp(tok, optnames[i].name, 16)) continue;
             if (optnames[i].word) cb->opts2 |= (u16)optnames[i].bit;
@@ -1182,9 +1274,9 @@ static int ini_read;            /* SYSTEM.INI options read (static load at the s
 int vxd_standalone_cb(const char *o)
 {
     if (!cb) {
-        cb = vmm_heap_alloc(sizeof(struct wincb));
+        cb = vmm_heap_alloc(WIN_BPBXOFF + WIN_MAXUNITS * WIN_BPBXSIZE);
         if (!cb) return -1;
-        memset(cb, 0, sizeof(struct wincb));
+        memset(cb, 0, WIN_BPBXOFF + WIN_MAXUNITS * WIN_BPBXSIZE);
         cb->magic = WIN_MAGIC;
         cb->version = WIN_VERSION;
         cb->size = sizeof(struct wincb);
@@ -1212,6 +1304,110 @@ int vxd_standalone_cb(const char *o)
     if (cb->opts & OPT_COM1) com_port = 0x3F8;
     standalone = 1;
     return 0;
+}
+
+#ifdef WIN_USB
+extern int usb_wdm_on;
+extern u16 usb_wdm_ids[8][2];
+extern int usb_wdm_nids;
+
+static int hexval(const char **ps, u16 *v)
+{
+    const char *s = *ps;
+    int n = 0;
+    u16 x = 0;
+    for (;; s++, n++) {
+        char c = *s;
+        if (c >= '0' && c <= '9') x = (u16)(x * 16 + (c - '0'));
+        else if ((c | 0x20) >= 'a' && (c | 0x20) <= 'f') x = (u16)(x * 16 + ((c | 0x20) - 'a' + 10));
+        else break;
+    }
+    *ps = s;
+    *v = x;
+    return n;
+}
+
+/* the USB WDM bridge (Windows 98 / ME, inc/wdmbr.h): on unless SYSTEM.INI [WINUSB] says
+   WDM=OFF; WDM=vvvv:pppp,... gives these devices to their Windows drivers even though WINUSB
+   knows their class (vvvv:* every device of the vendor) */
+static void wdm_setup(void)
+{
+    const char *s;
+    usb_wdm_on = vmm_version() >= 0x40A;
+    if (!usb_wdm_on || !profile_ok()) return;
+    s = vmm_profile_string("WINUSB", "WDM", "");
+    if (!s) return;
+    if ((s[0] | 0x20) == 'o' && (s[1] | 0x20) == 'f') {
+        usb_wdm_on = 0;
+        kprintf("vxd: WDM bridge off (SYSTEM.INI)\n");
+        return;
+    }
+    while (*s && usb_wdm_nids < 8) {
+        u16 vid, pid = 0xFFFF;
+        while (*s == ' ' || *s == ',' || *s == '\t') s++;
+        if (!hexval(&s, &vid)) break;
+        if (*s == ':') {
+            s++;
+            if (*s == '*') s++;
+            else if (!hexval(&s, &pid)) break;
+        }
+        usb_wdm_ids[usb_wdm_nids][0] = vid;
+        usb_wdm_ids[usb_wdm_nids][1] = pid;
+        usb_wdm_nids++;
+        kprintf("vxd: USB device %04x:%04x goes to its Windows driver (WDM bridge)\n", vid, pid);
+    }
+}
+#endif
+
+/* ---- Windows 95/98/ME registry (VMM): the driver installed for a PCI function ---- */
+extern u32 __cdecl vmm_reg_open(u32 key, const char *sub, u32 *out);
+extern u32 __cdecl vmm_reg_close(u32 key);
+extern u32 __cdecl vmm_reg_enum(u32 key, u32 i, char *name, u32 len);
+extern u32 __cdecl vmm_reg_query(u32 key, const char *name, u32 *rsv, u32 *type, void *data, u32 *len);
+#define HKLM 0x80000002UL
+
+static int reg_string(const char *path, const char *name, char *out, u32 max)
+{
+    u32 k, len = max - 1;
+    if (vmm_reg_open(HKLM, path, &k)) return -1;
+    memset(out, 0, max);
+    if (vmm_reg_query(k, name, NULL, NULL, out, &len)) out[0] = 0;
+    vmm_reg_close(k);
+    return out[0] ? 0 : -1;
+}
+
+/* 1 when the PCI function's devnode has this VxD as its device loader, or when that cannot
+   be told (no registry yet, no devnode yet: Windows installs the driver later) */
+int plat_pnp_ours(u32 bdf)
+{
+    static char path[160], name[96], drv[64], loader[32];
+    u32 k, i;
+    u16 ven = (u16)pci_rd32((int)(bdf >> 8), (int)((bdf >> 3) & 0x1F), (int)(bdf & 7), 0),
+        dev = (u16)(pci_rd32((int)(bdf >> 8), (int)((bdf >> 3) & 0x1F), (int)(bdf & 7), 0) >> 16);
+    char pre[24], inst[32];
+    int found = 0;
+    if (vmm_version() < 0x400) return 1;
+    ksnprintf(pre, sizeof(pre), "VEN_%04X&DEV_%04X", ven, dev);
+    ksnprintf(inst, sizeof(inst), "BUS_%02lX&DEV_%02lX&FUNC_%02lX", bdf >> 8, (bdf >> 3) & 0x1F, bdf & 7);
+    if (vmm_reg_open(HKLM, "Enum\\PCI", &k)) return 1;
+    for (i = 0; i < 256 && !found; i++) {
+        memset(name, 0, sizeof(name));
+        if (vmm_reg_enum(k, i, name, sizeof(name) - 1)) break;
+        if (strncmp(name, pre, 17)) continue;
+        ksnprintf(path, sizeof(path), "Enum\\PCI\\%s\\%s", name, inst);
+        if (reg_string(path, "Driver", drv, sizeof(drv)) == 0) found = 1;
+    }
+    vmm_reg_close(k);
+    if (!found) return 1;
+    ksnprintf(path, sizeof(path), "System\\CurrentControlSet\\Services\\Class\\%s", drv);
+    if (reg_string(path, "DevLoader", loader, sizeof(loader))) return 1;
+    for (i = 0; loader[i]; i++)
+        if (loader[i] >= 'a' && loader[i] <= 'z') loader[i] = (char)(loader[i] - 32);
+#ifdef WIN_USB
+    return !strncmp(loader, "WINUSB.VXD", 11);
+#else
+    return !strncmp(loader, "WINDISK.VXD", 12);
+#endif
 }
 
 static int standalone_cb(void)
@@ -1271,6 +1467,9 @@ static void core_start(u32 vm, struct crs *c, int pnp)
     p.cb_lin = (u32)cb;
     p.mode = PM_VXD;
     if (pnp) p.flags = CPF_PNP;
+#ifdef WIN_USB
+    wdm_setup();
+#endif
 #if defined(WIN_DISK) || defined(WIN_USB)
     /* the BIOS drives, while the BIOS still runs its controllers */
     if (pnp) bios_scan();
@@ -1311,11 +1510,9 @@ static int device_init(u32 vm, struct crs *c)
 {
     if (!core_up) core_start(vm, c, 0);
 #ifdef WIN_USB
-    /* Windows 3.x: the PS/2 mouse is ours (Windows 95/98/ME: through its Plug and Play devnode) */
-    if (vmm_version() < 0x400) {
-        sysvm = vm;
-        ps2_start(12);
-    }
+    /* Windows 3.x: the PS/2 mouse becomes ours when WINMOUSE.DRV registers (Windows
+       95/98/ME: through its Plug and Play devnode too) */
+    if (vmm_version() < 0x400) sysvm = vm;
 #endif
     if (!core_up) return 0;
     if (!tsc_per_us || !cb->tsc_khz) calibrate_tsc();
@@ -1329,6 +1526,229 @@ static int device_init(u32 vm, struct crs *c)
     return 0;
 }
 
+#ifdef WIN_AUDIO
+/* ---- Sound Blaster emulation in MS-DOS boxes (and for Windows programs that program the
+   card directly): the ports are trapped in every virtual machine, VDMAD hands over the
+   emulated DMA channels, VPICD the interrupt. The card belongs to the machine that used it
+   last. */
+#include "sbemu.h"
+extern void __cdecl thk_sbio(void);
+extern void __cdecl thk_sbdma(void);
+extern void __cdecl thk_sbeoi(void);
+extern void __cdecl thk_sbhw(void);
+extern int __cdecl vmm_install_io(u32 port, void *h);
+extern void __cdecl vmm_untrap_io(u32 port);
+extern int __cdecl vmm_remove_io(u32 port);
+extern u32 __cdecl vdmad_phys_status(void);
+extern u32 __cdecl vdmad_virtualize(u32 ch, void *cbf);
+extern void __cdecl vdmad_get_state(u32 h, u32 vm, u32 *out);
+extern void __cdecl vdmad_set_state(u32 h, u32 vm, u32 addr, u32 count, u32 modeflags);
+extern void __cdecl vpicd_request(u32 h, u32 vm, u32 set);
+
+static u32 sb_vm, sb_irqh, sb_dmah[2];
+static struct vid sbvid;
+static u32 sb_dlin[2], sb_dcnt[2], sb_dmode[2], sb_dunit[2];
+static u16 sb_port[24];
+static int sb_nport, sb_installed;
+static u8 sb_line;
+
+u32 plat_us(void)
+{
+    if (!tsc_per_us) return vmm_system_time() * 1000UL;
+    return (u32)((cpu_rdtsc64() - tsc_base) / tsc_per_us);
+}
+
+u8 *plat_sb_mem(u32 lin, u32 len)
+{
+    (void)len;
+    return lin ? (u8 *)lin : NULL;
+}
+
+void plat_sb_irq(int level)
+{
+    sb_line = (u8)level;
+    if (sb_irqh && sb_vm) vpicd_request(sb_irqh, sb_vm, (u32)level);
+}
+
+/* The program reads the DMA counters through VDMAD, and VDMAD answers them from the 8237
+   itself: the count register of the emulated channel follows the transfer (the channel
+   stays masked, no device asks for it); the virtual state moves along. */
+void plat_sb_dma(int which, u32 left, int tc)
+{
+    struct winsb *c = sb_cfg();
+    int ch = which ? c->dma16 : c->dma8;
+    u32 done, flags = 0;
+    u16 cnt = (u16)(left ? left / sb_dunit[which] - 1 : 0xFFFF);
+    if (!sb_dmah[which] || !sb_vm || !sb_dcnt[which]) return;
+    done = sb_dcnt[which] - left;
+    if (tc && !(sb_dmode[which] & 0x10) && !left) flags = 1;     /* DMA_masked */
+    if (ch < 4) {
+        outb(0x0C, 0);
+        outb((u16)(ch * 2 + 1), (u8)cnt);
+        outb((u16)(ch * 2 + 1), (u8)(cnt >> 8));
+    } else {
+        outb(0xD8, 0);
+        outb((u16)(0xC2 + (ch - 4) * 4), (u8)cnt);
+        outb((u16)(0xC2 + (ch - 4) * 4), (u8)(cnt >> 8));
+    }
+    vdmad_set_state(sb_dmah[which], sb_vm, sb_dlin[which] + done, left, (sb_dmode[which] & 0xFF) | (flags << 8));
+}
+
+/* Windows 95/98/ME: the status registers of the two 8237s (ports 08h, D0h) come from here
+   instead of VDMAD, so the terminal count of an emulated channel shows: VDMAD's view of the
+   hardware (its status bytes, read without taking them from VDMAD) plus the emulated
+   channels. A terminal count bit is read once, as from the 8237. Commands are ignored. */
+static u8 dst_prev[2];
+
+static u32 dma_status(u32 port, u32 out)
+{
+    int k = port == 0xD0;
+    u32 st;
+    u8 hw, nw;
+    if (out) return 0;
+    st = vdmad_phys_status();
+    hw = (u8)(k ? st >> 8 : st);
+    nw = (u8)(hw & 0x0F & ~dst_prev[k]);
+    dst_prev[k] = (u8)(hw & 0x0F);
+    return (u8)((hw & 0xF0) | nw | sb_dma_status(k));
+}
+
+/* Windows 3.x (no Remove_IO_Handler): an IN AL from port 08h / D0h faults into VDMAD's
+   trap; the fault hooks see it first, take VDMAD's answer through Simulate_IO and add the
+   bits of the emulated channels */
+extern u32 v86gp_prev, pmgp_prev;
+extern void __cdecl thk_v86gp(void);
+extern void __cdecl thk_pmgp(void);
+extern int __cdecl vmm_hook_fault(u32 pm, u32 vec, void *handler, u32 *prev);
+extern u32 __cdecl vmm_simulate_in(u32 vm, u32 port, void *client);
+extern u32 __cdecl vmm_sel_base(u32 vm, u32 sel);
+
+int __cdecl vxd_iofault(u32 vm, struct crs *c, u32 pm)
+{
+    u32 lin, port, len;
+    u8 op;
+    if (pm) {
+        u32 base = vmm_sel_base(vm, c->cs);
+        if (base == 0xFFFFFFFFUL) return 0;
+        lin = base + c->eip;
+    } else {
+        lin = *(u32 *)(vm + 4) + ((u32)c->cs << 4) + (c->eip & 0xFFFF);
+    }
+    op = *(u8 *)lin;
+    if (op == 0xE4) {
+        port = *(u8 *)(lin + 1);
+        len = 2;
+    } else if (op == 0xEC) {
+        port = c->edx & 0xFFFF;
+        len = 1;
+    } else {
+        return 0;
+    }
+    if (port != 0x08 && port != 0xD0) return 0;
+    c->eax = (c->eax & ~0xFFUL) | ((vmm_simulate_in(vm, port, c) | sb_dma_status(port == 0xD0)) & 0xFF);
+    if (pm) c->eip += len;
+    else c->eip = (c->eip & ~0xFFFFUL) | ((c->eip + len) & 0xFFFF);
+    return 1;
+}
+
+u32 __cdecl vxd_sbio(u32 port, u32 val, u32 out, u32 vm)
+{
+    if (port == 0x08 || port == 0xD0) return dma_status(port, out);
+    if (port < 0x388 || port > 0x38B) sb_vm = vm;
+    return sb_io(port, val, (int)out);
+}
+
+/* VDMAD: the program changed the mask of an emulated channel. Address (linear) and count
+   come in bytes: the count is the length of the transfer, not the 8237 register. */
+void __cdecl vxd_sbdma(u32 h, u32 vm)
+{
+    u32 st[3];
+    int w = h == sb_dmah[1];
+    vdmad_get_state(h, vm, st);
+    sb_vm = vm;
+    sb_dmode[w] = st[2] & 0xFF;
+    if (!(st[2] & 0x100)) {         /* unmasked: a new transfer */
+        sb_dlin[w] = st[0];
+        /* Windows 3.1 leaves garbage in the upper half */
+        sb_dcnt[w] = st[1] > 0x20000UL ? st[1] & 0xFFFF : st[1];
+        if (!sb_dcnt[w]) sb_dcnt[w] = 0x10000UL;
+    }
+    sb_vdma(w, sb_dlin[w], sb_dcnt[w], (sb_dmode[w] >> 4) & 1, (st[2] >> 8) & 1);
+    kprintf("sb: DMA %d %s %08lx count %lx mode %02lx\n", w, (st[2] & 0x100) ? "masked" : "unmasked",
+            st[0], st[1], st[2] & 0xFF);
+}
+
+/* edge-triggered like the ISA card: the request ends with the EOI */
+void __cdecl vxd_sbeoi(u32 h, u32 vm)
+{
+    vpicd_request(h, vm, 0);
+}
+
+static void sb_port_add(u32 port)
+{
+    if (sb_nport >= (int)ARRAY_SIZE(sb_port)) return;
+    if (vmm_install_io(port, (void *)thk_sbio)) {
+        kprintf("sb: port %lx is taken\n", port);
+        return;
+    }
+    sb_port[sb_nport++] = (u16)port;
+}
+
+int plat_sb_start(void)
+{
+    struct winsb *c = sb_cfg();
+    u32 i;
+    if (sb_installed) return 0;
+    for (i = 0; i < 16; i++) sb_port_add(c->base + i);
+    if (sb_nport < 16) {
+        while (sb_nport) vmm_untrap_io(sb_port[--sb_nport]);
+        kprintf("sb: ports %x-%x not available, no emulation\n", c->base, c->base + 15);
+        return -1;
+    }
+    if (!(c->flags & SBF_NOOPL))
+        for (i = 0; i < 4; i++) sb_port_add(0x388 + i);
+    if (c->mpu) {
+        sb_port_add(c->mpu);
+        sb_port_add(c->mpu + 1);
+    }
+    if (vmm_version() >= 0x400) {
+        /* the DMA status registers (terminal count of the emulated channels) */
+        static const u16 stp[2] = { 0x08, 0xD0 };
+        for (i = 0; i < 2; i++)
+            if (vmm_remove_io(stp[i]) || vmm_install_io(stp[i], (void *)thk_sbio))
+                kprintf("sb: DMA status port %x not taken over\n", stp[i]);
+    } else if (vmm_hook_fault(0, 13, (void *)thk_v86gp, &v86gp_prev) ||
+               vmm_hook_fault(1, 13, (void *)thk_pmgp, &pmgp_prev)) {
+        kprintf("sb: general protection fault hooks refused\n");
+    }
+    sb_dunit[0] = 1;
+    sb_dunit[1] = 2;
+    sb_dmah[0] = vdmad_virtualize(c->dma8, (void *)thk_sbdma);
+    if (c->dma16 >= 5) sb_dmah[1] = vdmad_virtualize(c->dma16, (void *)thk_sbdma);
+    if (!sb_dmah[0]) kprintf("sb: DMA %d not available\n", c->dma8);
+    memset(&sbvid, 0, sizeof(sbvid));
+    sbvid.irq = c->irq == 2 ? 9 : c->irq;
+    sbvid.options = 2;              /* VPICD_Opt_Can_Share */
+    sbvid.hw_int = (u32)thk_sbhw;
+    sbvid.eoi = (u32)thk_sbeoi;
+    sbvid.iret_timeout = 500;
+    sb_irqh = vpicd_virtualize(&sbvid);
+    if (!sb_irqh) kprintf("sb: IRQ %d not available\n", c->irq);
+    c->flags |= SBF_VXD;
+    c->flags &= (u8)~(SBF_DOSTRAP | SBF_RTC);
+    sb_installed = 1;
+    return 0;
+}
+
+static void sb_vm_gone(u32 vm)
+{
+    if (sb_installed && vm == sb_vm) {
+        sb_reset_owner();
+        sb_vm = 0;
+    }
+}
+#endif
+
 extern char bss_begin[], bss_end[];
 extern u32 __cdecl vmm_hook_cm_regdrv(void);
 static int static_boot;         /* Windows 95/98/ME: loaded by SYSTEM.INI device= at the start */
@@ -1336,6 +1756,10 @@ static int static_boot;         /* Windows 95/98/ME: loaded by SYSTEM.INI device
 u32 __cdecl vxd_control(u32 msg, u32 vm, u32 edx, u32 esi, u32 edi)
 {
     (void)esi; (void)edi;
+    /* /D: the life of the MS-DOS boxes (VM_Not_Executeable: EDX = the reason) */
+    if (cb && (cb->opts & OPT_DEBUG) && msg >= 0x07 && msg <= 0x0C && vm != sysvm)
+        kprintf("vxd: VM %08lx %s %08lx\n", vm, msg == 0x07 ? "create" : msg == 0x08 ? "critical init" :
+                msg == 0x09 ? "init" : msg == 0x0A ? "terminate" : msg == 0x0B ? "not executeable" : "destroy", edx);
     switch (msg) {
     case 0x00:                  /* Sys_Critical_Init */
         memset(bss_begin, 0, (u32)(bss_end - bss_begin));
@@ -1400,9 +1824,19 @@ u32 __cdecl vxd_control(u32 msg, u32 vm, u32 edx, u32 esi, u32 edi)
             started = 0;
             core_shutdown(0);
         }
+#ifdef WIN_AUDIO
+        /* the port traps, DMA and interrupt hooks of the Sound Blaster emulation stay:
+           the code must stay loaded */
+        if (sb_installed) return 1;
+#endif
         return 0;
     case 0x22:                  /* PNP_New_DevNode: EBX = devnode, EDX = load type */
         return pnp_new_devnode(vm, edx);
+#ifdef WIN_AUDIO
+    case 0x0C:                  /* Destroy_VM */
+        sb_vm_gone(vm);
+        return 0;
+#endif
     }
     return 0;
 }

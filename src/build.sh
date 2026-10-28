@@ -29,8 +29,8 @@ FWSRC=$SRC/firmware
 
 COMMON="winlib pci acpi blk corent"
 DISKSRC="ide ahci nvme cdrom sdhci"
-USBSRC="usb uhci ohci ehci xhci hub hid ptp ps2tp kbc smbtp i2c dwi2c gpio msc uaudio uvc aeng synth nvme nhi tbt icm pcihp cdrom"
-AUDSRC="aeng synth hda afunc ac97 dsp dspipc4 dspipc3 dspdev dspcdc dspsst nhlt dwi2c sdw sdwlnk sdwstm sdwadv sdwrt71 sdwrt7l sdwamp sdwcs sdwmisc gpio cdces16 cdces26 cdcrt82 cdcrt10 cdcrt56 cdcrt63 cdcmax cdcda72 cdcnau cdccs42 cdctas cdcssm cdccx72 cdcm90 cdcrt86"
+USBSRC="usb usbwdm uhci ohci ehci xhci hub hid ptp ps2tp kbc smbtp i2c dwi2c gpio msc uaudio uvc aeng synth nvme nhi tbt icm pcihp cdrom"
+AUDSRC="aeng synth sbemu opl3 hda afunc ac97 dsp dspipc4 dspipc3 dspdev dspcdc dspsst nhlt dwi2c sdw sdwlnk sdwstm sdwadv sdwrt71 sdwrt7l sdwamp sdwcs sdwmisc gpio cdces16 cdces26 cdcrt82 cdcrt10 cdcrt56 cdcrt63 cdcmax cdcda72 cdcnau cdccs42 cdctas cdcssm cdccx72 cdcm90 cdcrt86"
 
 # build_pkg <name> <core files> <SYS name> <BIN name> <386 name> <C define> <NASM define> <Plug and Play files>
 HAVE_DISK=0; HAVE_USB=0; HAVE_AUDIO=0
@@ -52,22 +52,30 @@ build_pkg() {
   local pkg=$1 files=$2 sys=$3 bin=$4 vxd=$5 cdef=$6 ndef=$7 pnpf=$8
   local o=$OBJ/$pkg d=$(dest $pkg)
   mkdir -p $o/dos $o/vxd $d
-  local CF="-q -bt=windows -mf -s -zl -ox -wx -we -zp4 -ei -I$SRC/core -I$SRC/inc $cdef"
+  local CF="-q -bt=windows -mf -s -zl -ox -wx -we -zp4 -ei -I$SRC/core -I$SRC/inc $cdef $XCF"
   # DOS core (flat binary at 80004000h)
   for f in $files; do wcc386 $CF -fo=$o/dos/$f.obj $SRC/core/$f.c; done
   wcc386 $CF -fo=$o/dos/platdos.obj $SRC/dos/platdos.c
   nasm -f obj -o $o/dos/dosent.obj $SRC/dos/dosent.asm
+  # WINAUDIO: the V86 monitor (VCPI server, DPMI host) of the DOS core
+  local dosx=""
+  if [ $pkg = audio ]; then
+    for f in vmon dpmi; do wcc386 $CF -I$SRC/dos -fo=$o/dos/$f.obj $SRC/dos/$f.c; done
+    nasm -f obj -o $o/dos/vmonent.obj $SRC/dos/vmonent.asm
+    dosx="vmon dpmi vmonent"
+  fi
   {
     echo "format raw bin"
     echo "name $d/$bin"
     echo "option offset=0x80004000"
     echo "option nodefaultlibs, quiet, map=$o/dos/core.map"
+    echo "disable 1023"
     echo "library $WATCOM/lib386/dos/clib3r.lib"
     echo "order clname CODE segment _HDR clname DATA clname BSS segment _BSSHEAD clname STACK clname ZZEND"
     echo "file $o/dos/dosent.obj"
-    for f in $files platdos; do echo "file $o/dos/$f.obj"; done
+    for f in $files platdos $dosx; do echo "file $o/dos/$f.obj"; done
   } > $o/dos/core.lnk
-  wlink @$o/dos/core.lnk 2>&1 | grep -v "W1023" || true
+  wlink @$o/dos/core.lnk
   # VxD
   for f in $files; do wcc386 $CF -nt=_LTEXT -nc=CODE -fo=$o/vxd/$f.obj $SRC/core/$f.c; done
   wcc386 $CF -nt=_LTEXT -nc=CODE -fo=$o/vxd/platvxd.obj $SRC/vxd/platvxd.c
@@ -146,6 +154,43 @@ U=$(dest usb)
 
 # WINUSB.PDR: Windows 95/98/ME I/O Supervisor port driver (disks of WINUSB.VXD)
 build_pdr $U WINUSB.PDR WINUSBPD "" "WINUSB port driver for the Windows 95 I/O Supervisor"
+
+# WINUSBW.SYS: the WDM bus driver of the USB WDM bridge (Windows 98 / ME): Windows drivers for
+# the USB devices WINUSB has no class driver for
+mkdir -p $OBJ/wdm
+wcc386 -q -bt=nt -zl -s -ox -ecc -wx -we -zp8 -D_WIN32_WINNT=0x0501 -I$WATCOM/h/nt/ddk -I$WATCOM/h/nt -I$WATCOM/h -fo=$OBJ/wdm/winusbw.obj $SRC/wdm/winusbw.c
+nasm -f obj -I$SRC/inc/ -o $OBJ/wdm/wbsvc.obj $SRC/wdm/wbsvc.asm
+{
+  echo "format windows nt"
+  echo "runtime native"
+  echo "name $U/WINUSBW.SYS"
+  echo "option quiet, nodefaultlibs, start='_DriverEntry@8', offset=0x10000, map=$OBJ/wdm/winusbw.map"
+  echo "option description 'WINUSB USB WDM bridge bus driver for Windows 98 / ME'"
+  echo "library $WATCOM/lib386/nt/ddk/ntoskrnl.lib"
+  echo "file $OBJ/wdm/winusbw.obj, $OBJ/wdm/wbsvc.obj"
+} > $OBJ/wdm/winusbw.lnk
+wlink @$OBJ/wdm/winusbw.lnk
+# USBD.SYS: the USB descriptor helpers Windows drivers import (only where Windows' own is missing)
+wcc386 -q -bt=nt -zl -s -ox -ecc -wx -we -zp8 -D_WIN32_WINNT=0x0501 -I$WATCOM/h/nt/ddk -I$WATCOM/h/nt -I$WATCOM/h -fo=$OBJ/wdm/usbd.obj $SRC/wdm/usbd.c
+{
+  echo "format windows nt dll"
+  echo "runtime native"
+  echo "name $U/USBD.SYS"
+  echo "option modname='USBD.SYS'"
+  echo "option quiet, nodefaultlibs, start='_DriverEntry@8', offset=0x10000, map=$OBJ/wdm/usbd.map"
+  echo "option description 'WINUSB USBD descriptor helpers for Windows drivers on the WDM bridge'"
+  echo "library $WATCOM/lib386/nt/ddk/ntoskrnl.lib"
+  echo "file $OBJ/wdm/usbd.obj, $OBJ/wdm/wbsvc.obj"
+  for f in ParseDescriptors@16 ParseConfigurationDescriptorEx@28 ParseConfigurationDescriptor@12 \
+           GetInterfaceLength@8 CreateConfigurationRequestEx@8 CreateConfigurationRequest@8 GetUSBDIVersion@4 \
+           CalculateUsbBandwidth@12 QueryBusTime@8 RegisterHcFilter@8 GetPdoRegistryParameter@20; do
+    echo "export 'USBD_${f%@*}'='_USBD_$f'"
+  done
+  for f in ParseDescriptors@16 ParseConfigurationDescriptorEx@28 CreateConfigurationRequestEx@8; do
+    echo "export '_USBD_$f'"
+  done
+} > $OBJ/wdm/usbd.lnk
+wlink @$OBJ/wdm/usbd.lnk
 
 # WINDRVCI.DLL: icons of the device classes Windows 95 lacks (USB, HID, imaging)
 nasm -f obj -o $OBJ/win/windrvci.obj $SRC/win/windrvci.asm
@@ -233,9 +278,9 @@ if [ $HAVE_UDF = 1 ]; then
   UF="-q -ms -s -os -zl -zq -wx -we -DUDF_DOS16 -I$SRC/udf"
   nasm -f obj -o $F/udfdos_a.obj $SRC/udf/udfdos.asm
   for f in udfcore udfwr udfdos; do wcc $UF -fo=$F/$f.obj $SRC/udf/$f.c; done
-  wcc $UF -zc -nt=INIT_TEXT -nc=INITCODE -fo=$F/udfinit.obj $SRC/udf/udfinit.c
+  wcc $UF -nt=INIT_TEXT -nc=INITCODE -fo=$F/udfinit.obj $SRC/udf/udfinit.c
   {
-    echo "format dos com"
+    echo "format dos"
     echo "name $(dest udf)/WINUDF.EXE"
     echo "option quiet, map=$F/winudf.map, nodefaultlibs"
     echo "library $WATCOM/lib286/dos/clibs.lib"
@@ -325,13 +370,13 @@ if [ -f $SRC/win/winsound.c ] && { [ $HAVE_USB = 1 ] || [ $HAVE_AUDIO = 1 ]; }; 
     echo "format windows dll"
     echo "name $A/WINSOUND.DRV"
     echo "option modname=WINSOUND"
-    echo "option description 'wave,midi,aux:WINSOUND HD Audio, AC97 and USB Audio'"
+    echo "option description 'wave,midi,aux,mixer:WINSOUND HD Audio, AC97 and USB Audio'"
     echo "option quiet, map=$OBJ/win/winsound.map"
     echo "segment type CODE preload fixed"
     echo "segment type DATA preload fixed"
     echo "file $OBJ/win/winsndlb.obj, $OBJ/win/winsound.obj"
     echo "library $WATCOM/lib286/win/windows.lib, $WATCOM/lib286/win/mmsystem.lib, $WATCOM/lib286/win/clibl.lib"
-    echo "export WEP, DRIVERPROC.1, WODMESSAGE.2, WIDMESSAGE.3, MODMESSAGE.4, MIDMESSAGE.5, AUXMESSAGE.6, TIMERPROC"
+    echo "export WEP, DRIVERPROC.1, WODMESSAGE.2, WIDMESSAGE.3, MODMESSAGE.4, MIDMESSAGE.5, AUXMESSAGE.6, MXDMESSAGE.7, TIMERPROC"
   } > $OBJ/win/winsound.lnk
   wlink @$OBJ/win/winsound.lnk
   # SOUND driver for Windows 3.0 (MessageBeep and the voice API on the synthesizer, all modes)

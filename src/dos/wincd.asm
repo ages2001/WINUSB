@@ -238,9 +238,9 @@ print:  push ax
         ret
 
 %ifdef PKG_USB
-msg_banner      db 'WINUCD 1.0 - USB CD/DVD drives of WINUSB for MSCDEX', 13, 10, '$'
+msg_banner      db 'WINUCD 1.1 - USB CD/DVD drives of WINUSB for MSCDEX', 13, 10, '$'
 %else
-msg_banner      db 'WINCD 1.0 - CD/DVD drives of WINDISK for MSCDEX', 13, 10, '$'
+msg_banner      db 'WINCD 1.1 - CD/DVD drives of WINDISK for MSCDEX', 13, 10, '$'
 %endif
 msg_ok          db CDSYS, ': device ', DEVNAME, ', '
 msg_n           db '0 unit(s)', 13, 10, '$'

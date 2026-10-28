@@ -6,7 +6,7 @@
 #pragma pack(push, 1)
 
 #define WIN_MAGIC        0x42433357UL    /* 'WINCB' */
-#define WIN_VERSION      0x0100
+#define WIN_VERSION      0x0110
 #define WIN_MAXUNITS     24
 #define WIN_KQLEN        20
 #define WIN_MPLEX_DISK   0xD3            /* INT 2Fh multiplex id of WINDISK.SYS */
@@ -37,6 +37,8 @@
 #define US_CHANGED  0x02
 #define US_WPROT    0x04
 #define US_EJECTED  0x08
+#define US_FOREIGN  0x10      /* a file system DOS cannot mount: a small empty read-only volume */
+#define US_TAKEN    0x20      /* the drive letter of the slot went to another driver (MSCDEX) */
 
 struct winunit {                 /* 64 bytes */
     unsigned char  type;
@@ -138,6 +140,8 @@ struct winfw {
 #define OPT2_NOPS2      0x0400  /* /NOPS2    : (WINUSB) leave the PS/2 mouse to Windows / the BIOS in 386 enhanced mode */
 #define OPT2_NOTP       0x1000  /* /NOTP     : (WINUSB) PS/2 touchpads stay in their mouse mode, no SMBus touchpads */
 #define OPT2_NOSMB      0x2000  /* /NOSMB    : (WINUSB) touchpads on PS/2 only, not on SMBus */
+#define OPT2_NOTPVOL    0x4000  /* /NOTPVOL  : (WINAUDIO) leave the ThinkPad volume / mute switch alone */
+#define OPT2_USBSB      0x8000  /* /USBSB    : (WINAUDIO) the Sound Blaster emulation plays on WINUSB's USB Audio device */
 
 struct winmount {                /* partition already mounted by DOS through INT 13h */
     unsigned char  biosdrv;
@@ -210,6 +214,10 @@ struct wincb {                   /* 2048 bytes, lives in WINDISK.SYS / WINUSB.SY
    core drives in its own protocol, caught on IRQ 12, and the packets the core makes for the
    pointing device BIOS callback of the DOS mouse driver */
 #define WIN_CBSIZE      2048
+/* the full BPBs of the units (FAT32: 53 bytes, MS-DOS 7.10 and later) follow at this offset
+   from the control block, 64 bytes per unit: the BPB pointer array of the driver points here */
+#define WIN_BPBXOFF     2304
+#define WIN_BPBXSIZE    64
 #define WIN_AUXQ        64
 #define WIN_AUXPK       16
 struct wincbx {
@@ -226,6 +234,141 @@ struct wincbx {
     unsigned char  pk[WIN_AUXPK][4];    /* 76 status, X, Y, Z */
 };
 
+/* WINUSB, WINDISK: DOS data the core needs, at this offset from the control block (WINAUDIO
+   has struct winsb there) */
+#define WIN_DOSOFF      2192
+struct windos {
+    unsigned long  lol;         /* 0  DOS List of Lists (INT 21h AH=52h), seg:off */
+    unsigned char  hide;        /* 4  WINUSB: Windows 95/98/ME runs, every DOS drive of the units is hidden */
+};
+
+/* Sound Blaster 16 emulation (WINAUDIO): settings and the state the real-mode code of
+   WINAUDIO.SYS works with, at this offset from the control block */
+#define WIN_SBOFF       2192
+struct winsb {
+    unsigned short base;        /* 0  DSP base port (220h), 0: no emulation */
+    unsigned short mpu;         /* 2  MPU-401 port (330h), 0: none */
+    unsigned char  irq;         /* 4  5 or 7 (2, 10 too) */
+    unsigned char  dma8;        /* 5  0, 1 or 3 */
+    unsigned char  dma16;       /* 6  5, 6 or 7 (the 8-bit channel when 0) */
+    unsigned char  flags;       /* 7  SBF_* */
+    unsigned char  irqedge;     /* 8  set by the core when the interrupt line rises */
+    unsigned char  irqline;     /* 9  interrupt line */
+    unsigned char  rdstat;      /* 10 DSP read buffer status (bit 7: data to read) */
+    unsigned char  mpustat;     /* 11 MPU-401 status (bit 7 clear: data to read) */
+    unsigned char  oplidx[2];   /* 12 OPL register index, bank 0 / 1 */
+    unsigned char  t1, t2;      /* 14 OPL timer counts */
+    unsigned char  tctl;        /* 16 OPL timer control (register 4) */
+    unsigned char  tstat;       /* 17 OPL status bits 7-5 */
+    unsigned char  pic;         /* 18 DOS: OCW3 read register command seen during a simulated IRQ */
+    unsigned char  inirq;       /* 19 DOS: a simulated IRQ handler runs */
+    unsigned long  t1lo, t1hi;  /* 20 TSC at the start of OPL timer 1 */
+    unsigned long  t2lo, t2hi;  /* 28 TSC at the start of OPL timer 2 */
+    unsigned long  tsc80;       /* 36 TSC ticks in 80 us */
+    unsigned long  qpi;         /* 40 DOS: QPI entry (seg:off), 0 none */
+    unsigned short ntraps;      /* 44 DOS: ports trapped */
+    unsigned short irqs;        /* 46 interrupts raised */
+    unsigned long  tticks;      /* 48 DOS: RTC ticks */
+    char           spec[24];    /* 52 /SB:A220,I5,D1,H5,P330 as given */
+};
+#define SBF_ON          0x01    /* emulation runs */
+#define SBF_NOOPL       0x02    /* no FM synthesizer ports */
+#define SBF_NOMPU       0x04    /* no MPU-401 */
+#define SBF_DOSTRAP     0x08    /* DOS: ports trapped through the QPI of QEMM / JEMM + QPIEMU */
+#define SBF_RTC         0x10    /* DOS: driven by the RTC periodic interrupt */
+#define SBF_VXD         0x20    /* Windows: the VxD emulates it in MS-DOS boxes */
+#define SBF_V86         0x40    /* DOS: the built-in V86 monitor of WINAUDIO.SYS traps the ports */
+#define SBF_OFF         0x80    /* /NOSB */
+
+/* Sound bridge between WINAUDIO and WINUSB, at this offset from the control block of both:
+   the Sound Blaster emulation and the synthesizer of WINAUDIO play on a USB Audio device of
+   WINUSB. WINAUDIO (the producer) mixes into a ring in its memory; WINUSB (the consumer)
+   plays that ring as a stream of its own. DOS: the drivers link their control blocks at
+   their start (peer); VxDs of Windows 95/98/ME find each other through Get_DDB (WINDRV's
+   DDB is followed by 'WBRG' and the address of this block). */
+#define WIN_BROFF       2272
+#define WINBR_MAGIC     0x47524257UL    /* 'WBRG' */
+struct winbridge {
+    unsigned long  magic;       /* 0  WINBR_MAGIC: the block is in use */
+    unsigned long  peer;        /* 4  DOS: seg:off of the other driver's control block */
+    unsigned long  phys;        /* 8  producer: ring (struct winring + data), physical */
+    unsigned long  lin;         /* 12 producer: ring, linear in the VxD (VMM's address space) */
+    unsigned long  size;        /* 16 producer: ring data bytes */
+    unsigned long  rate;        /* 20 producer: 16-bit stereo at this rate */
+    unsigned short seq;         /* 24 producer: changes when the ring is set up again */
+    unsigned char  state;       /* 26 producer: 1 the ring runs; consumer: 1 it plays the ring */
+    unsigned char  outs;        /* 27 consumer: USB Audio outputs present */
+    unsigned long  beat;        /* 28 consumer: counts its services of the ring */
+};
+
+/* WINAUDIO.SYS: the built-in V86 monitor (no EMM386 / JEMM needed), VCPI server and DPMI host,
+   at this offset from the control block (WINAUDIO has no BPBs there). WINAUDIO.SYS fills in
+   the offsets of its real-mode pieces before FN_VMSTART. */
+#define WIN_VMOFF       2304
+struct winvm {
+    unsigned short flags;       /* 0  VMF_* */
+    unsigned short drvseg;      /* 2  segment of WINAUDIO.SYS */
+    unsigned long  xms;         /* 4  XMS driver entry (seg:off) */
+    unsigned short o_ret;       /* 8  return of the monitor's real-mode calls (hypercall) */
+    unsigned short o_rawpm;     /* 10 DPMI raw switch real -> protected mode (hypercall) */
+    unsigned short o_cbs;       /* 12 DPMI real-mode callbacks, 2 bytes each */
+    unsigned short o_rmnull;    /* 14 DPMI state save / restore in real mode (RETF) */
+    unsigned short o_rm16;      /* 16 16-bit protected-mode code back to real mode */
+    unsigned short o_term;      /* 18 INT 21h (program termination with AX) */
+    unsigned short o_callret;   /* 20 call_ret of the core call (dword) */
+    unsigned short o_vret;      /* 22 V86 return point of the core call */
+    unsigned short o_savess;    /* 24 its real-mode SS (word) */
+    unsigned short o_saveesp;   /* 26 and ESP (dword) */
+    unsigned short o_gw;        /* 28 VCPI gateway data (VMGW_*) */
+    unsigned short o_gwpm;      /* 30 VCPI protected-mode entry */
+    unsigned short o_gwvc;      /* 32 switch into a VCPI client */
+    unsigned short o_rmss;      /* 34 real-mode exit: SS, SP (words) */
+    unsigned char  cpu;         /* 36 CPU family for DPMI (3..6) */
+    unsigned char  ncb;         /* 37 real-mode callbacks */
+    unsigned short o_iret;      /* 38 IRET (INT 67h without an EMS driver) */
+    unsigned long  bios70;      /* 40 INT 70h vector at the start (the BIOS) */
+    unsigned long  traps;       /* 44 port accesses trapped */
+    unsigned long  ints;        /* 48 interrupts reflected to real mode */
+    unsigned short clients;     /* 52 DPMI clients started */
+    unsigned short vcpis;       /* 54 VCPI mode switches */
+    unsigned short o_rmtgt;     /* 56 real-mode exit: far pointer to the real-mode part */
+    unsigned char  pmode;       /* 58 a DPMI client is active */
+    unsigned char  rsv;         /* 59 */
+    unsigned short o_vmon;      /* 60 vm_on (byte): core calls go through the monitor */
+    unsigned short rsv2;        /* 62 */
+};
+#define VMF_ON          0x0001  /* the monitor runs (DOS in V86 mode) */
+#define VMF_NODPMI      0x0002  /* /NODPMI */
+#define VMF_NOVCPI      0x0004  /* /NOVCPI */
+#define VMF_NOVME       0x0008  /* /NOVME: virtual-8086 mode extensions not used */
+#define VMF_VME         0x0010  /* VME in use */
+#define VMF_WIN         0x0020  /* switched back to real mode for Windows 386 enhanced mode */
+#define VMF_NOV86       0x0040  /* /NOV86 */
+#define VMF_DEBUG       0x0080  /* /VMDEBUG: log to the debug port */
+#define VMF_WINSTD      0x0100  /* Windows standard mode runs (it needs VCPI) */
+#define VMF_VCPI        0x0200  /* /VCPI: VCPI for every program (else only without DPMI) */
+#define VMF_USEVME      0x0400  /* /VME: use the virtual-8086 mode extensions (faster INT n) */
+/* VCPI gateway data in WINAUDIO.SYS (offsets from o_gw) */
+#define VMGW_CR3        0
+#define VMGW_CR4        4
+#define VMGW_GDTR       8
+#define VMGW_IDTR       14
+#define VMGW_TSSD       20
+#define VMGW_ESP0P      24
+#define VMGW_EXIT       28
+#define VMGW_LDT        34
+#define VMGW_TR         36
+#define VMGW_DS         38
+#define VMGW_CCR3       40
+#define VMGW_CGDTR      44
+#define VMGW_CIDTR      50
+#define VMGW_CLDT       56
+#define VMGW_CTR        58
+#define VMGW_CEIP       60
+#define VMGW_CCS        64
+#define VMGW_REGS       68
+#define VMGW_FRAME      100
+
 /* parameters passed by the platform to core_init */
 struct core_params {
     unsigned long pool_lin;
@@ -235,7 +378,7 @@ struct core_params {
     unsigned long mode;         /* 1 DOS, 2 VxD */
     unsigned long flags;
     unsigned long mbr_lin;      /* DOS: MBR sectors of BIOS disks 80h.. (nbios * 512 bytes) */
-    unsigned long rsv[2];
+    unsigned long rsv[2];       /* [0] DOS loaded high: the same sectors read into the HMA */
 };
 
 /* ---- application API (INT 2Fh AH=mplex AL=01h, ES:BX -> winapireq) ---- */
@@ -248,6 +391,7 @@ struct core_params {
 #define WINF_RAWREAD     0x0021
 #define WINF_CDREQ       0x0023  /* buf: DOS request header for the CD-ROM device (WINCD.SYS) */
 #define WINF_RAWIO       0x0024  /* arg0 disk | 80000000h write, arg1:arg2 LBA, buf/buflen: sectors */
+#define WINF_BIOSMAP     0x0025  /* buf: winbiosmap: the BIOS disks on controllers the driver took */
 #define WINF_UNITS       0x0022  /* buf: winunit array (nunits entries), first drive in wininfo */
 #define WINF_LOG         0x0030
 #define WINF_SETOPT      0x0040
@@ -258,6 +402,7 @@ struct core_params {
                                    buf: winring (seg:off) -> retlen stream id */
 #define WINF_AUD_CTL     0x0052  /* arg0 stream, arg1 AC_*, arg2 value */
 #define WINF_AUD_MIX     0x0053  /* arg0 dev, arg1 MX_* (| 0x80000000 set), arg2 value -> retlen value */
+#define WINF_AUD_SB      0x0055  /* buf: winsb (Sound Blaster emulation settings and state) */
 #define WINF_AUD_MIDI    0x0054  /* arg0 dev (0xFF synthesizer), arg1 short message or buf/buflen */
 
 /* USB video class cameras (WINUSB) */
@@ -276,6 +421,12 @@ struct core_params {
 #define WINE_SMALL       4
 #define WINE_BUSY        5
 #define WINE_NOCORE      6
+
+struct winbiosmap {              /* WINF_BIOSMAP: BIOS disk 80h + k is our disk disk[k] - 1 */
+    unsigned char  disk[8];
+    unsigned long  sectors[8];  /* 512-byte sectors (low 32 bits) */
+    unsigned long  sectorshi[8];
+};
 
 struct winapireq {               /* 32 bytes */
     unsigned short fn;
@@ -446,6 +597,7 @@ struct wintbnode {               /* 64 bytes */
 #define UD_MIDI     8
 #define UD_TABLET   9
 #define UD_VIDEO    10
+#define UD_WDM      11          /* given to its Windows driver through the WDM bridge (98 / ME) */
 
 struct winusbnode {              /* 160 bytes */
     unsigned char  type;        /* UN_* */

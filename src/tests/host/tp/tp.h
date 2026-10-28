@@ -39,7 +39,7 @@ static void plat_mouse(int dx, int dy, int dz, int dw, int b)
 {
     int i;
     ev_n++; ev_dx += dx; ev_dy += dy; ev_dz += dz; ev_dw += dw;
-    for (i = 0; i < 3; i++) if ((b & (1 << i)) && !(ev_lastbtn & (1 << i))) ev_clicks[i]++;
+    for (i = 0; i < 5; i++) if ((b & (1 << i)) && !(ev_lastbtn & (1 << i))) ev_clicks[i]++;
     ev_lastbtn = b; ev_btn = b;
     if (verbose > 1) printf("  mouse %d %d wheel %d %d btn %d\n", dx, dy, dz, dw, b);
 }

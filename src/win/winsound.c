@@ -1,6 +1,7 @@
 /* winsound.c - WINSOUND.DRV: MMSYSTEM sound driver for Windows 3.1 and Windows 3.0 with the
-   Multimedia Extensions. Wave output and input, the MIDI synthesizer (and USB MIDI ports)
-   and auxiliary volumes of the WINAUDIO (HD Audio, AC'97) and WINUSB (USB Audio) drivers.
+   Multimedia Extensions. Wave output and input, the MIDI synthesizer (and USB MIDI ports),
+   auxiliary volumes and (Windows 95, 98 and ME) the mixer of the WINAUDIO (HD Audio, AC'97)
+   and WINUSB (USB Audio) drivers. The volumes are kept in SYSTEM.INI [winsound.drv].
 
    Every open stream has a ring buffer in conventional memory (GlobalDosAlloc) that the
    driver core reads (playback) or writes (recording) on its own. A periodic multimedia
@@ -98,6 +99,7 @@ UINT WINAPI GlobalDosFree(UINT sel);
 
 #define WAVE_FORMAT_IEEE_FLOAT  3
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MK_FP(s, o) ((void __far *)(((DWORD)(s) << 16) | (WORD)(o)))
 
 /* ---- devices ---- */
@@ -123,8 +125,8 @@ static WORD reqsel, reqseg;
 static struct winapireq FAR *rq;
 static int scanned, enhanced;
 
-static struct sdev wouts[MAXDEV], wins[MAXDEV], mouts[MAXDEV], auxs[MAXDEV];
-static int nwout, nwin, nmout, naux;
+static struct sdev wouts[MAXDEV], wins[MAXDEV], mouts[MAXDEV], auxs[MAXDEV], mixs[MAXDEV];
+static int nwout, nwin, nmout, naux, nmix;
 
 /* ---- open streams ---- */
 #define WQLEN       32
@@ -376,6 +378,11 @@ static void merge(int k, int loading)
         if ((d->caps & WINAC_OUT) && (e = bind_dev(wouts, &nwout, k, d, NULL, loading)) != NULL) e->gone = d->gone;
         if ((d->caps & WINAC_IN) && (e = bind_dev(wins, &nwin, k, d, NULL, loading)) != NULL) e->gone = d->gone;
         if ((d->caps & WINAC_MIDI) && (e = bind_dev(mouts, &nmout, k, d, " MIDI", loading)) != NULL) e->gone = d->gone;
+        if (d->caps & (WINAC_OUT | WINAC_IN)) {
+            /* a mixer for each device found while the driver loads */
+            if ((e = find_dev(mixs, nmix, k, d->id, 0)) != NULL) e->gone = d->gone;
+            else if (loading) add_dev(mixs, &nmix, k, d, NULL);
+        }
         if ((d->caps & WINAC_SYNTH) && !d->gone && !synth) {
             /* the synthesizer plays on the first present device of the core */
             synth = 1;
@@ -522,6 +529,22 @@ static void callback(struct wstream *w, UINT msg, DWORD p1)
     if (w->cbflags) DriverCallback(w->cb, w->cbflags, (HANDLE)w->hwave, msg, w->inst, p1, 0);
 }
 
+/* buffers above 64K (sndPlaySound passes a whole WAV file) are huge: their selectors are
+   tiled, __AHINCR apart */
+static WORD ahincr = 8;
+
+static BYTE FAR *hptr(const void FAR *base, DWORD off)
+{
+    DWORD o = (DWORD)OFFSETOF(base) + off;
+    return (BYTE FAR *)MK_FP(SELECTOROF(base) + (WORD)(o >> 16) * ahincr, (WORD)o);
+}
+
+/* bytes from base + off to the end of that 64K tile */
+static DWORD tile_left(const void FAR *base, DWORD off)
+{
+    return 0x10000UL - (WORD)((DWORD)OFFSETOF(base) + off);
+}
+
 static struct winring FAR *ringp(struct wstream *w)
 {
     return MK_FP(w->ringsel, 0);
@@ -576,9 +599,10 @@ static void out_fill(struct wstream *w)
         n = (WORD)MIN(left, space);
         if (n > w->size - off) n = (WORD)(w->size - off);
         if (n > 0x8000) n = 0x8000;
-        n -= n % w->align;
+        if (n > tile_left(h->lpData, w->curoff)) n = (WORD)tile_left(h->lpData, w->curoff);
+        if (n >= w->align) n -= n % w->align;
         if (!n) break;
-        fmemcpy(data + off, h->lpData + w->curoff, n);
+        fmemcpy(data + off, hptr(h->lpData, w->curoff), n);
         w->curoff += n;
         r->wr += n;
     }
@@ -616,7 +640,8 @@ static void in_take(struct wstream *w)
             n = (WORD)MIN(avail, room);
             if (n > w->size - off) n = (WORD)(w->size - off);
             if (n > 0x8000) n = 0x8000;
-            fmemcpy(h->lpData + h->dwBytesRecorded, data + off, n);
+            if (n > tile_left(h->lpData, h->dwBytesRecorded)) n = (WORD)tile_left(h->lpData, h->dwBytesRecorded);
+            fmemcpy(hptr(h->lpData, h->dwBytesRecorded), data + off, n);
             h->dwBytesRecorded += n;
             r->rd += n;
             continue;
@@ -657,9 +682,9 @@ static DWORD wave_open(int dir, struct sdev *dev, LPWAVEOPENDESC od, DWORD flags
     WORD bits;
     DWORD bps, size, r;
     int i, st;
+    if (dev->gone) return MMSYSERR_NODRIVER;
     if (!check_format(f, &bits)) return WAVERR_BADFORMAT;
     if (flags & WAVE_FORMAT_QUERY) return MMSYSERR_NOERROR;
-    if (dev->gone) return MMSYSERR_NODRIVER;
     for (i = 0; i < MAXOPEN; i++)
         if (!ws[i].used) {
             w = &ws[i];
@@ -805,9 +830,13 @@ static DWORD vol_get(struct sdev *d, int ctl, DWORD FAR *v)
     return MMSYSERR_NOERROR;
 }
 
+static void vol_changed(int core, int id, int ctl);
+
 static DWORD vol_set(struct sdev *d, int ctl, DWORD v)
 {
-    return api(d->core, WINF_AUD_MIX, d->id, (DWORD)ctl | 0x80000000L, v, 0, 0) ? MMSYSERR_ERROR : MMSYSERR_NOERROR;
+    if (api(d->core, WINF_AUD_MIX, d->id, (DWORD)ctl | 0x80000000L, v, 0, 0)) return MMSYSERR_ERROR;
+    vol_changed(d->core, d->id, ctl);
+    return MMSYSERR_NOERROR;
 }
 
 DWORD CALLBACK __loadds wodMessage(UINT id, UINT msg, DWORD user, DWORD p1, DWORD p2)
@@ -824,7 +853,7 @@ DWORD CALLBACK __loadds wodMessage(UINT id, UINT msg, DWORD user, DWORD p1, DWOR
         fmemset(&c, 0, sizeof(c));
         c.wMid = 0x6033;
         c.wPid = (WORD)(0x10 + wouts[id].type);
-        c.vDriverVersion = 0x0100;
+        c.vDriverVersion = 0x0110;
         fstrncpy(c.szPname, wouts[id].name, MAXPNAMELEN);
         c.dwFormats = 0x0FFF;
         c.wChannels = 2;
@@ -904,7 +933,7 @@ DWORD CALLBACK __loadds widMessage(UINT id, UINT msg, DWORD user, DWORD p1, DWOR
         fmemset(&c, 0, sizeof(c));
         c.wMid = 0x6033;
         c.wPid = (WORD)(0x20 + wins[id].type);
-        c.vDriverVersion = 0x0100;
+        c.vDriverVersion = 0x0110;
         fstrncpy(c.szPname, wins[id].name, MAXPNAMELEN);
         c.dwFormats = 0x0FFF;
         c.wChannels = 2;
@@ -983,7 +1012,8 @@ static void midi_long(struct mstream *m, LPMIDIHDR h)
     DWORD done = 0;
     while (done < h->dwBufferLength) {
         WORD n = (WORD)MIN(h->dwBufferLength - done, MIDICHUNK);
-        fmemcpy(MK_FP(reqsel, RQ_MIDI), h->lpData + done, n);
+        if (n > tile_left(h->lpData, done)) n = (WORD)tile_left(h->lpData, done);
+        fmemcpy(MK_FP(reqsel, RQ_MIDI), hptr(h->lpData, done), n);
         api(m->core, WINF_AUD_MIDI, m->dev, 0, 0, RQBUF(RQ_MIDI), n);
         done += n;
     }
@@ -1013,7 +1043,7 @@ DWORD CALLBACK __loadds modMessage(UINT id, UINT msg, DWORD user, DWORD p1, DWOR
         fmemset(&c, 0, sizeof(c));
         c.wMid = 0x6033;
         c.wPid = (WORD)(0x30 + mouts[id].ctl);
-        c.vDriverVersion = 0x0100;
+        c.vDriverVersion = 0x0110;
         fstrncpy(c.szPname, mouts[id].name, MAXPNAMELEN);
         c.wTechnology = mouts[id].ctl ? MOD_SYNTH : MOD_MIDIPORT;
         c.wVoices = mouts[id].ctl ? 32 : 0;
@@ -1105,7 +1135,7 @@ DWORD CALLBACK __loadds auxMessage(UINT id, UINT msg, DWORD user, DWORD p1, DWOR
         fmemset(&c, 0, sizeof(c));
         c.wMid = 0x6033;
         c.wPid = (WORD)(0x40 + auxs[id].ctl);
-        c.vDriverVersion = 0x0100;
+        c.vDriverVersion = 0x0110;
         fstrncpy(c.szPname, auxs[id].name, MAXPNAMELEN);
         c.wTechnology = auxs[id].ctl == MX_CD ? AUXCAPS_CDAUDIO : AUXCAPS_AUXIN;
         c.dwSupport = AUXCAPS_VOLUME | AUXCAPS_LRVOLUME;
@@ -1120,6 +1150,489 @@ DWORD CALLBACK __loadds auxMessage(UINT id, UINT msg, DWORD user, DWORD p1, DWOR
     return MMSYSERR_NOTSUPPORTED;
 }
 
+/* ---------------------------------------------------------------- saved volumes */
+
+/* SYSTEM.INI [winsound.drv] Volume<core>.<device>= the MX_* volumes, the recording source and
+   the master mute, in hex. Saved on every change, set again when the driver loads. */
+#define VOLSEC      "winsound.drv"
+#define NSAVE       (MX_COUNT + 2)
+
+static const char sysini[] = "SYSTEM.INI";
+
+static int save_ctl(int i)
+{
+    return i < MX_COUNT ? i : i == MX_COUNT ? MX_SRC : MX_MUTE;
+}
+
+static void vol_save(int core, int id)
+{
+    char key[16], val[100], old[100];
+    DWORD v[NSAVE];
+    int i;
+    for (i = 0; i < NSAVE; i++) {
+        if (api(core, WINF_AUD_MIX, id, (DWORD)save_ctl(i), 0, 0, 0)) return;
+        v[i] = rq->retlen;
+    }
+    wsprintf(val, "%lX %lX %lX %lX %lX %lX %lX %lX", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+    wsprintf(key, "Volume%d.%d", core, id);
+    GetPrivateProfileString(VOLSEC, key, "", old, sizeof(old), sysini);
+    if (lstrcmp(old, val)) WritePrivateProfileString(VOLSEC, key, val, sysini);
+}
+
+static void vol_load(int core, int id)
+{
+    char key[16], val[100], *p = val;
+    int i;
+    wsprintf(key, "Volume%d.%d", core, id);
+    if (!GetPrivateProfileString(VOLSEC, key, "", val, sizeof(val), sysini)) return;
+    for (i = 0; i < NSAVE; i++) {
+        DWORD v = 0;
+        int n = 0;
+        while (*p == ' ') p++;
+        for (;; p++, n++) {
+            char c = *p;
+            if (c >= '0' && c <= '9') v = v << 4 | (c - '0');
+            else if (c >= 'A' && c <= 'F') v = v << 4 | (c - 'A' + 10);
+            else if (c >= 'a' && c <= 'f') v = v << 4 | (c - 'a' + 10);
+            else break;
+        }
+        if (!n) break;
+        if (save_ctl(i) == MX_SRC && !v) continue;
+        api(core, WINF_AUD_MIX, id, (DWORD)save_ctl(i) | 0x80000000L, v, 0, 0);
+    }
+}
+
+/* ---------------------------------------------------------------- mixer */
+
+/* Windows 95, 98 and ME: the mixer API (SNDVOL32, the volume icon of the taskbar). A mixer
+   for each device: the speakers (master volume and mute; wave, synthesizer and on AC'97 the
+   CD and line inputs) and the recording (source list, the level on each source). Lines are numbered in the order
+   of the table, control k of line i has the ID i * 2 + k. */
+#define MXDM_GETNUMDEVS         1
+#define MXDM_GETDEVCAPS         2
+#define MXDM_OPEN               3
+#define MXDM_CLOSE              4
+#define MXDM_GETLINEINFO        5
+#define MXDM_GETLINECONTROLS    6
+#define MXDM_GETCONTROLDETAILS  7
+#define MXDM_SETCONTROLDETAILS  8
+#define MXDM_INIT               0x64
+
+#define MM_MIXM_CONTROL_CHANGE  0x3D1
+#define MIXERR_INVALLINE        1024
+#define MIXERR_INVALCONTROL     1025
+#define MIXERR_INVALVALUE       1026
+
+#define ML_ACTIVE               0x00000001UL
+#define ML_SOURCE               0x80000000UL
+#define CT_DST_SPEAKERS         4UL
+#define CT_DST_WAVEIN           7UL
+#define CT_SRC_LINE             0x1002UL
+#define CT_SRC_MICROPHONE       0x1003UL
+#define CT_SRC_SYNTHESIZER      0x1004UL
+#define CT_SRC_COMPACTDISC      0x1005UL
+#define CT_SRC_WAVEOUT          0x1008UL
+#define CT_SRC_AUXILIARY        0x1009UL
+#define CT_SRC_ANALOG           0x100AUL
+#define TT_WAVEOUT              1UL
+#define TT_WAVEIN               2UL
+
+#define CTL_VOLUME              0x50030001UL
+#define CTL_MUTE                0x20010002UL
+#define CTL_MUX                 0x70010001UL
+#define CF_UNIFORM              1UL
+#define CF_MULTIPLE             2UL
+
+#define CK_MUTE                 0x10    /* control codes: MX_* volumes, mute, source list */
+#define CK_MUX                  0x11
+
+#pragma pack(push, 1)
+typedef struct {
+    WORD wMid, wPid, vDriverVersion;
+    char szPname[MAXPNAMELEN];
+    DWORD fdwSupport, cDestinations;
+} MXCAPS;
+
+typedef struct {
+    DWORD cbStruct, dwDestination, dwSource, dwLineID, fdwLine, dwUser, dwComponentType;
+    DWORD cChannels, cConnections, cControls;
+    char szShortName[16], szName[64];
+    DWORD dwType, dwDeviceID;
+    WORD wMid, wPid, vDriverVersion;
+    char szPname[MAXPNAMELEN];
+} MXLINE;
+
+typedef struct {
+    DWORD cbStruct, dwControlID, dwControlType, fdwControl, cMultipleItems;
+    char szShortName[16], szName[64];
+    DWORD dwMinimum, dwMaximum, rsvb[4];
+    DWORD cSteps, rsvm[5];
+} MXCTL;
+
+typedef struct {
+    DWORD cbStruct, dwLineID, dwControl, cControls, cbmxctrl;
+    BYTE FAR *pamxctrl;
+} MXLCTLS;
+
+typedef struct {
+    DWORD cbStruct, dwControlID, cChannels, cMultipleItems, cbDetails;
+    BYTE FAR *paDetails;
+} MXDETAILS;
+
+typedef struct {
+    DWORD dwParam1, dwParam2;
+    char szName[64];
+} MXTEXT;
+
+typedef struct {
+    WORD hmx;
+    void FAR *pReserved0;
+    DWORD dwCallback, dwInstance, dnDevNode;
+} MXOPEN;
+#pragma pack(pop)
+
+struct mln {
+    BYTE dest, src, nctl, nconn, chans, bit;    /* src 0xFF: destination; bit: AS_* */
+    BYTE ctl[2];
+    DWORD comp, ttype;
+    const char *sn, *ln;
+};
+
+#define MAXLINE     12
+#define MAXMXOPEN   8
+
+struct mxclient {
+    BYTE used, mix;
+    WORD flags, hmx;
+    DWORD cb, inst;
+};
+
+static struct mxclient mxcl[MAXMXOPEN];
+
+static int add_line(struct mln *t, int n, int dest, int src, DWORD comp, DWORD ttype, const char *sn,
+                    const char *ln, int c0, int c1)
+{
+    struct mln *l = &t[n];
+    fmemset(l, 0, sizeof(*l));
+    l->dest = (BYTE)dest;
+    l->src = (BYTE)src;
+    l->comp = comp;
+    l->ttype = ttype;
+    l->sn = sn;
+    l->ln = ln;
+    l->chans = 2;
+    if (c0 >= 0) l->ctl[l->nctl++] = (BYTE)c0;
+    if (c1 >= 0) l->ctl[l->nctl++] = (BYTE)c1;
+    return n + 1;
+}
+
+/* the lines of mixer m: destinations first, then their sources */
+static int mlines(struct sdev *m, struct mln *t)
+{
+    static const BYTE bits[5] = { AS_MIC, AS_LINE, AS_CD, AS_AUX, AS_MIX };
+    static const DWORD comps[5] = { CT_SRC_MICROPHONE, CT_SRC_LINE, CT_SRC_COMPACTDISC, CT_SRC_AUXILIARY,
+                                    CT_SRC_ANALOG };
+    static const char *const names[5] = { "Microphone", "Line In", "CD Audio", "Aux", "Stereo Mix" };
+    int n = 0, dout = -1, din = -1, nd = 0, i, s, nsrc = 0;
+    if (m->caps & WINAC_OUT) {
+        dout = nd++;
+        n = add_line(t, n, dout, 0xFF, CT_DST_SPEAKERS, 0, "Volume", "Volume Control", MX_MASTER, CK_MUTE);
+    }
+    for (i = 0; i < 5; i++) nsrc += (m->insrcs & bits[i]) != 0;
+    if (m->caps & WINAC_IN) {
+        /* the recording level is one for all sources: on the source lines (Volume Control
+           shows only lines with a volume), on the destination when there are none; the
+           source list needs two sources at least */
+        din = nd++;
+        n = add_line(t, n, din, 0xFF, CT_DST_WAVEIN, TT_WAVEIN, "Recording", "Recording Control",
+                     nsrc ? -1 : MX_INGAIN, nsrc > 1 ? CK_MUX : -1);
+    }
+    if (dout >= 0) {
+        s = 0;
+        n = add_line(t, n, dout, s++, CT_SRC_WAVEOUT, TT_WAVEOUT, "Wave", "Wave", MX_WAVE, -1);
+        if (m->caps & WINAC_SYNTH)
+            n = add_line(t, n, dout, s++, CT_SRC_SYNTHESIZER, 0, "SW Synth", "SW Synth", MX_SYNTH, -1);
+        if (m->type == 2) {     /* AC'97: analog CD and line inputs */
+            n = add_line(t, n, dout, s++, CT_SRC_COMPACTDISC, 0, "CD Audio", "CD Audio", MX_CD, -1);
+            n = add_line(t, n, dout, s++, CT_SRC_LINE, 0, "Line In", "Line In", MX_LINE, -1);
+        }
+        t[0].nconn = (BYTE)s;
+    }
+    if (din >= 0) {
+        s = 0;
+        for (i = 0; i < 5; i++)
+            if (m->insrcs & bits[i]) {
+                n = add_line(t, n, din, s++, comps[i], 0, names[i], names[i], MX_INGAIN, -1);
+                t[n - 1].bit = bits[i];
+                if (bits[i] == AS_MIC) t[n - 1].chans = 1;
+            }
+        t[din].nconn = (BYTE)s;
+    }
+    return n;
+}
+
+static int ndests(struct sdev *m)
+{
+    return ((m->caps & WINAC_OUT) != 0) + ((m->caps & WINAC_IN) != 0);
+}
+
+static void fill_line(struct sdev *m, struct mln *t, int i, MXLINE FAR *out)
+{
+    MXLINE x;
+    struct sdev *w = NULL;
+    fmemset(&x, 0, sizeof(x));
+    x.cbStruct = out->cbStruct;
+    x.dwDestination = t[i].dest;
+    x.dwSource = t[i].src == 0xFF ? 0 : t[i].src;
+    x.dwLineID = (DWORD)i;
+    x.fdwLine = ML_ACTIVE | (t[i].src == 0xFF ? 0 : ML_SOURCE);
+    x.dwComponentType = t[i].comp;
+    x.cChannels = t[i].chans;
+    x.cConnections = t[i].src == 0xFF ? t[i].nconn : 0;
+    x.cControls = t[i].nctl;
+    fstrncpy(x.szShortName, t[i].sn, sizeof(x.szShortName));
+    fstrncpy(x.szName, t[i].ln, sizeof(x.szName));
+    x.dwType = t[i].ttype;
+    if (t[i].ttype == TT_WAVEOUT && (w = find_dev(wouts, nwout, m->core, m->id, 0)) != NULL) {
+        x.dwDeviceID = (DWORD)(w - wouts);
+        x.wPid = (WORD)(0x10 + w->type);
+    } else if (t[i].ttype == TT_WAVEIN && (w = find_dev(wins, nwin, m->core, m->id, 0)) != NULL) {
+        x.dwDeviceID = (DWORD)(w - wins);
+        x.wPid = (WORD)(0x20 + w->type);
+    }
+    if (w) {
+        x.wMid = 0x6033;
+        x.vDriverVersion = 0x0110;
+        fstrncpy(x.szPname, w->name, MAXPNAMELEN);
+    }
+    fmemcpy(out, &x, (WORD)MIN(out->cbStruct, sizeof(x)));
+}
+
+static DWORD ctl_type(int code)
+{
+    return code == CK_MUTE ? CTL_MUTE : code == CK_MUX ? CTL_MUX : CTL_VOLUME;
+}
+
+static void fill_ctl(struct mln *t, int i, int k, BYTE FAR *out, DWORD cb)
+{
+    MXCTL x;
+    int code = t[i].ctl[k];
+    const char *sn = "Volume", *ln = "Volume";
+    fmemset(&x, 0, sizeof(x));
+    x.cbStruct = sizeof(x);
+    x.dwControlID = (DWORD)i * 2 + k;
+    x.dwControlType = ctl_type(code);
+    x.dwMaximum = 0xFFFF;
+    x.cSteps = 256;
+    if (code == CK_MUTE) {
+        x.fdwControl = CF_UNIFORM;
+        x.dwMaximum = 1;
+        x.cSteps = 0;
+        sn = ln = "Mute";
+    } else if (code == CK_MUX) {
+        x.fdwControl = CF_UNIFORM | CF_MULTIPLE;
+        x.cMultipleItems = t[i].nconn;
+        x.dwMaximum = t[i].nconn ? t[i].nconn - 1 : 0;
+        x.cSteps = t[i].nconn;
+        sn = "Source";
+        ln = "Recording Source";
+    }
+    fstrncpy(x.szShortName, sn, sizeof(x.szShortName));
+    fstrncpy(x.szName, ln, sizeof(x.szName));
+    fmemcpy(out, &x, (WORD)MIN(cb, sizeof(x)));
+}
+
+static DWORD mix_lineinfo(struct sdev *m, MXLINE FAR *ml, DWORD flags)
+{
+    struct mln t[MAXLINE];
+    int n = mlines(m, t), i;
+    for (i = 0; i < n; i++) {
+        struct mln *l = &t[i];
+        int hit;
+        switch ((WORD)flags & 0x0F) {
+        case 0: hit = l->src == 0xFF && l->dest == ml->dwDestination; break;
+        case 1: hit = l->src != 0xFF && l->dest == ml->dwDestination && l->src == ml->dwSource; break;
+        case 2: hit = (DWORD)i == ml->dwLineID; break;
+        case 3: hit = l->comp == ml->dwComponentType; break;
+        case 4: hit = l->ttype && l->ttype == ml->dwType; break;
+        default: return MMSYSERR_INVALFLAG;
+        }
+        if (hit) {
+            fill_line(m, t, i, ml);
+            return MMSYSERR_NOERROR;
+        }
+    }
+    return MIXERR_INVALLINE;
+}
+
+static DWORD mix_linectls(struct sdev *m, MXLCTLS FAR *lc, DWORD flags)
+{
+    struct mln t[MAXLINE];
+    int n = mlines(m, t), i, k;
+    switch ((WORD)flags & 0x0F) {
+    case 0:         /* all */
+        i = (int)lc->dwLineID;
+        if (lc->dwLineID >= (DWORD)n) return MIXERR_INVALLINE;
+        if (lc->cControls < t[i].nctl || !t[i].nctl) return MMSYSERR_INVALPARAM;
+        for (k = 0; k < t[i].nctl; k++) fill_ctl(t, i, k, lc->pamxctrl + (WORD)(k * lc->cbmxctrl), lc->cbmxctrl);
+        return MMSYSERR_NOERROR;
+    case 1:         /* one by ID */
+        i = (int)(lc->dwControl / 2);
+        k = (int)(lc->dwControl % 2);
+        if (lc->dwControl / 2 >= (DWORD)n || k >= t[i].nctl) return MIXERR_INVALCONTROL;
+        lc->dwLineID = (DWORD)i;
+        fill_ctl(t, i, k, lc->pamxctrl, lc->cbmxctrl);
+        return MMSYSERR_NOERROR;
+    case 2:         /* one by type */
+        i = (int)lc->dwLineID;
+        if (lc->dwLineID >= (DWORD)n) return MIXERR_INVALLINE;
+        for (k = 0; k < t[i].nctl; k++)
+            if (ctl_type(t[i].ctl[k]) == lc->dwControl) {
+                fill_ctl(t, i, k, lc->pamxctrl, lc->cbmxctrl);
+                return MMSYSERR_NOERROR;
+            }
+        return MIXERR_INVALCONTROL;
+    }
+    return MMSYSERR_INVALFLAG;
+}
+
+static DWORD mix_details(struct sdev *m, MXDETAILS FAR *cd, DWORD flags, int set)
+{
+    struct mln t[MAXLINE];
+    int n = mlines(m, t), i, k, code, j;
+    DWORD v, FAR *pa = (DWORD FAR *)cd->paDetails;
+    i = (int)(cd->dwControlID / 2);
+    k = (int)(cd->dwControlID % 2);
+    if (cd->dwControlID / 2 >= (DWORD)n || k >= t[i].nctl) return MIXERR_INVALCONTROL;
+    code = t[i].ctl[k];
+    if ((WORD)flags & 0x0F) {
+        /* list text of the source list */
+        MXTEXT FAR *lt = (MXTEXT FAR *)cd->paDetails;
+        if (set || code != CK_MUX) return MMSYSERR_NOTSUPPORTED;
+        for (j = 0; j < n && (DWORD)(lt - (MXTEXT FAR *)cd->paDetails) < cd->cMultipleItems; j++)
+            if (t[j].src != 0xFF && t[j].dest == t[i].dest) {
+                fmemset(lt, 0, sizeof(*lt));
+                lt->dwParam1 = (DWORD)j;
+                lt->dwParam2 = t[j].comp;
+                fstrncpy(lt->szName, t[j].ln, sizeof(lt->szName));
+                lt = (MXTEXT FAR *)((BYTE FAR *)lt + (WORD)cd->cbDetails);
+            }
+        return MMSYSERR_NOERROR;
+    }
+    if (code == CK_MUX) {
+        DWORD FAR *p = pa;
+        if (set) {
+            for (j = 0; j < n; j++)
+                if (t[j].src != 0xFF && t[j].dest == t[i].dest) {
+                    if (*p) return vol_set(m, MX_SRC, t[j].bit);
+                    p = (DWORD FAR *)((BYTE FAR *)p + (WORD)cd->cbDetails);
+                }
+            return MMSYSERR_NOERROR;
+        }
+        if (vol_get(m, MX_SRC, &v)) return MMSYSERR_ERROR;
+        for (j = 0; j < n; j++)
+            if (t[j].src != 0xFF && t[j].dest == t[i].dest) {
+                *p = (t[j].bit & (BYTE)v) != 0;
+                p = (DWORD FAR *)((BYTE FAR *)p + (WORD)cd->cbDetails);
+            }
+        return MMSYSERR_NOERROR;
+    }
+    if (code == CK_MUTE) {
+        if (set) return vol_set(m, MX_MUTE, *pa != 0);
+        if (vol_get(m, MX_MUTE, &v)) return MMSYSERR_ERROR;
+        *pa = v != 0;
+        return MMSYSERR_NOERROR;
+    }
+    if (set) {
+        DWORD l = pa[0], r = cd->cChannels > 1 ? pa[1] : l;
+        if (l > 0xFFFF) l = 0xFFFF;
+        if (r > 0xFFFF) r = 0xFFFF;
+        return vol_set(m, code, l | (r << 16));
+    }
+    if (vol_get(m, code, &v)) return MMSYSERR_ERROR;
+    if (cd->cChannels > 1) {
+        pa[0] = v & 0xFFFF;
+        pa[1] = v >> 16;
+    } else {
+        pa[0] = MAX(v & 0xFFFF, v >> 16);
+    }
+    return MMSYSERR_NOERROR;
+}
+
+/* a volume changed (from any of the driver's APIs): saved, and the mixer clients are told */
+static void vol_changed(int core, int id, int ctl)
+{
+    int mi, c, i, k, n;
+    int code = ctl == MX_MUTE ? CK_MUTE : ctl == MX_SRC ? CK_MUX : ctl;
+    vol_save(core, id);
+    for (mi = 0; mi < nmix; mi++) {
+        struct mln t[MAXLINE];
+        if (mixs[mi].core != core || mixs[mi].id != id) continue;
+        n = mlines(&mixs[mi], t);
+        for (i = 0; i < n; i++)
+            for (k = 0; k < t[i].nctl; k++) {
+                if (t[i].ctl[k] != code) continue;
+                for (c = 0; c < MAXMXOPEN; c++)
+                    if (mxcl[c].used && mxcl[c].mix == mi && mxcl[c].flags)
+                        DriverCallback(mxcl[c].cb, mxcl[c].flags, (HANDLE)mxcl[c].hmx, MM_MIXM_CONTROL_CHANGE,
+                                       mxcl[c].inst, (DWORD)i * 2 + k, 0);
+            }
+    }
+}
+
+DWORD CALLBACK __loadds mxdMessage(UINT id, UINT msg, DWORD user, DWORD p1, DWORD p2)
+{
+    struct sdev *m;
+    scan();
+    if (msg == MXDM_INIT) return MMSYSERR_NOERROR;
+    if (msg == MXDM_GETNUMDEVS) return nmix;
+    if (msg == MXDM_CLOSE) {
+        if (user && user <= MAXMXOPEN) mxcl[(WORD)user - 1].used = 0;
+        return MMSYSERR_NOERROR;
+    }
+    if (id >= (UINT)nmix) return MMSYSERR_BADDEVICEID;
+    m = &mixs[id];
+    switch (msg) {
+    case MXDM_GETDEVCAPS:
+    {
+        MXCAPS c;
+        struct sdev *w = find_dev(wouts, nwout, m->core, m->id, 0);
+        fmemset(&c, 0, sizeof(c));
+        c.wMid = 0x6033;
+        c.wPid = (WORD)(0x50 + m->type);
+        c.vDriverVersion = 0x0110;
+        fstrncpy(c.szPname, w ? w->name : m->name, MAXPNAMELEN);
+        c.cDestinations = (DWORD)ndests(m);
+        fmemcpy((void FAR *)p1, &c, (WORD)MIN(p2, sizeof(c)));
+        return MMSYSERR_NOERROR;
+    }
+    case MXDM_OPEN:
+    {
+        MXOPEN FAR *od = (MXOPEN FAR *)p1;
+        int c;
+        for (c = 0; c < MAXMXOPEN && mxcl[c].used; c++) ;
+        if (c == MAXMXOPEN) return MMSYSERR_ALLOCATED;
+        mxcl[c].used = 1;
+        mxcl[c].mix = (BYTE)id;
+        mxcl[c].hmx = od->hmx;
+        mxcl[c].cb = od->dwCallback;
+        mxcl[c].inst = od->dwInstance;
+        mxcl[c].flags = HIWORD(p2) & DCB_TYPEMASK;
+        *(DWORD FAR *)user = (DWORD)c + 1;
+        return MMSYSERR_NOERROR;
+    }
+    case MXDM_GETLINEINFO:
+        return mix_lineinfo(m, (MXLINE FAR *)p1, p2);
+    case MXDM_GETLINECONTROLS:
+        return mix_linectls(m, (MXLCTLS FAR *)p1, p2);
+    case MXDM_GETCONTROLDETAILS:
+        return mix_details(m, (MXDETAILS FAR *)p1, p2, 0);
+    case MXDM_SETCONTROLDETAILS:
+        return mix_details(m, (MXDETAILS FAR *)p1, p2, 1);
+    }
+    return MMSYSERR_NOTSUPPORTED;
+}
+
 /* ---------------------------------------------------------------- DriverProc */
 
 LRESULT CALLBACK __loadds DriverProc(DWORD id, HANDLE hdrv, UINT msg, LPARAM p1, LPARAM p2)
@@ -1127,7 +1640,14 @@ LRESULT CALLBACK __loadds DriverProc(DWORD id, HANDLE hdrv, UINT msg, LPARAM p1,
     (void)id; (void)hdrv; (void)p1; (void)p2;
     switch (msg) {
     case DRV_LOAD:
+        ahincr = (WORD)(DWORD)GetProcAddress(GetModuleHandle("KERNEL"), "__AHINCR");
+        if (!ahincr) ahincr = 8;
         scan();
+        {
+            int i;
+            for (i = 0; i < nmix; i++)
+                if (!mixs[i].gone) vol_load(mixs[i].core, mixs[i].id);
+        }
         return 1;
     case DRV_FREE:
         if (timer_id) {

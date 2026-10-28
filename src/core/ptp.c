@@ -4,7 +4,10 @@
    The touchpad is switched from mouse mode to touchpad mode (feature "Input Mode" = 3),
    then the contacts are turned into mouse events:
      one finger moves the pointer, a short tap clicks (two fingers: right, three: middle);
+     tap and touch again at once: the left button stays down while the finger moves (drag),
+     two quick taps: a double click;
      two fingers moving up or down turn the wheel, sideways the horizontal wheel;
+     three fingers swiping sideways: back (to the right) and forward (to the left);
      the pad's button clicks left, right with two fingers on the pad. */
 #ifndef USB_H
 #include "usb.h"
@@ -18,6 +21,8 @@
 #define TAP_MS      200
 #define TAP_UM      2500
 #define CLICK_MS    50
+#define DRAG_MS     180         /* a single tap holds the button this long: touch again to drag */
+#define SWIPE_UM    12000       /* three-finger travel sideways for back / forward */
 
 struct pfield {
     s16 off;                    /* bit offset after the report ID, -1: none */
@@ -69,6 +74,9 @@ struct ptp {
     int tapbtn;
     s32 tdx, tdy;               /* pointer counts of this touch (debug log) */
     u32 tapup;                  /* plat_ms() when the tap click ends */
+    u8 dragging;                /* tap and drag: the left button is held for this touch */
+    u8 swiped;                  /* back / forward given for this touch */
+    s32 swx;                    /* three-finger sideways travel of this touch, micrometres */
     void (*out)(int dx, int dy, int dz, int dw, int buttons);
 };
 
@@ -357,7 +365,7 @@ static s32 to_um(struct ptp *p, s32 d, int y)
 
 static void emit(struct ptp *p, s32 dx, s32 dy, int dz, int dw)
 {
-    int b = p->btnheld | (p->tapup ? p->tapbtn : 0);
+    int b = p->btnheld | (p->tapup ? p->tapbtn : 0) | (p->dragging ? 1 : 0);
     p->out((int)dx, (int)dy, dz, dw, b);
 }
 
@@ -379,6 +387,14 @@ static void frame(struct ptp *p)
                 break;
             }
     if (n && !p->nprev) {                           /* touch begins */
+        /* right after a single tap, whose click is still held: tap and drag */
+        if (p->tapup && p->tapbtn == 1) {
+            p->tapup = 0;
+            if (n == 1) p->dragging = 1;
+            else emit(p, 0, 0, 0, 0);               /* more fingers: the click ends now */
+        }
+        p->swiped = 0;
+        p->swx = 0;
         p->t_down = now;
         p->maxn = 0;
         p->travel = 0;
@@ -399,6 +415,16 @@ static void frame(struct ptp *p)
             dy = p->ry / p->yrange;
             p->rx -= dx * p->xrange;
             p->ry -= dy * p->yrange;
+        } else if (n >= 3) {
+            /* three fingers sideways: back / forward once per touch */
+            p->swx += ux;
+            if (!p->swiped && (p->swx > SWIPE_UM || p->swx < -SWIPE_UM)) {
+                p->swiped = 1;
+                p->tapbtn = p->swx > 0 ? 8 : 16;
+                p->tapup = plat_ms() + CLICK_MS;
+                if (!p->tapup) p->tapup = 1;
+                DBG2("ptp: three-finger swipe, button %d\n", p->tapbtn);
+            }
         } else if (n == 2) {
             s32 ux16 = p->xrange * 16, uy16 = p->yrange * 16;
             p->sx += mx / matched * p->nx;
@@ -421,11 +447,25 @@ static void frame(struct ptp *p)
         DBG2("ptp: pad button up, %d contact(s)\n", n);
     }
     /* tap: short touch without travel and without the pad button */
-    if (!n && p->nprev && now - p->t_down < TAP_MS && p->travel < TAP_UM && !p->clicked && !p->curbtn) {
-        p->tapbtn = p->maxn >= 3 ? 4 : p->maxn == 2 ? 2 : 1;
-        p->tapup = plat_ms() + CLICK_MS;   /* ptp_tick ends it */
+    if (!n && p->nprev && now - p->t_down < TAP_MS && p->travel < TAP_UM && !p->clicked && !p->curbtn &&
+        !p->swiped) {
+        if (p->dragging) {
+            /* the second tap of a double tap: release, then the second click */
+            p->dragging = 0;
+            emit(p, 0, 0, 0, 0);
+            p->tapbtn = 1;
+            p->tapup = plat_ms() + CLICK_MS;
+        } else {
+            p->tapbtn = p->maxn >= 3 ? 4 : p->maxn == 2 ? 2 : 1;
+            /* a single tap holds its click a little longer: a touch meanwhile drags */
+            p->tapup = plat_ms() + (p->tapbtn == 1 ? DRAG_MS : CLICK_MS);   /* ptp_tick ends it */
+        }
         if (!p->tapup) p->tapup = 1;
         DBG2("ptp: tap, button %d\n", p->tapbtn);
+    }
+    if (!n && p->nprev && p->dragging) {
+        p->dragging = 0;                            /* drag ends with the touch */
+        DBG2("ptp: drag ends\n");
     }
     if (dz || dw) DBG2("ptp: wheel %d %d\n", dz, dw);
     p->tdx += dx;

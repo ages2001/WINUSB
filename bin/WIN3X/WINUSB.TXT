@@ -1,4 +1,6 @@
-# WINUSB 1.0 — USB driver for DOS and Windows 1.0–3.11 / 95 / 98 / ME
+# WINUSB 1.1 — USB driver for DOS and Windows 1.0–3.11 / 95 / 98 / ME
+
+The complete manual. **README.md** has the short overview and the installation.
 
 WINUSB is a USB stack written from scratch for MS-DOS 5 / 6, Windows 1.0x, 2.x, 3.0, 3.1 /
 Windows for Workgroups 3.11 and Windows 95 / 98 / ME:
@@ -16,13 +18,14 @@ Windows for Workgroups 3.11 and Windows 95 / 98 / ME:
   **autoscroll** (click the wheel and move the mouse to scroll, with a scroll cursor) on
   all Windows versions (§3)
 * **Multi-partition USB disks:** every partition (MBR, extended, GPT) gets its own letter;
-  4 letter slots by default, more when the disks plugged in at boot have more partitions
+  2 letter slots by default, more when the disks plugged in at boot have more partitions
 * **Touchpads** on every system (DOS, Windows 1.0x–3.11, 95/98/ME): USB and **I2C**
   precision touchpads (HID over I2C: ACPI `PNP0C50` / `ACPI0C50`, Intel LPSS and AMD I2C
   controllers, the HID descriptor address from `_DSM`, the `GpioInt` interrupt line),
   **PS/2** touchpads (Synaptics, ELAN) and **SMBus** touchpads (Synaptics InterTouch / RMI4,
   ELAN); **two-finger scrolling** (vertical and horizontal), tap to click, two-finger tap =
-  right click, clickpads, TrackPoint (§4a)
+  right click, double tap, tap and drag, **three-finger swipe** = back / forward, clickpads,
+  TrackPoint with middle-button scrolling (§4a)
 * **USB cameras** (UVC 1.0–1.5; YUY2, NV12, Motion-JPEG; isochronous and bulk) and
   **WINCAM.EXE**: live picture, photos (BMP), video (AVI) (§5a)
 * **USB Audio 1.0 / 2.0** sound cards, headsets, DACs and **USB MIDI** output (through
@@ -41,6 +44,14 @@ Windows for Workgroups 3.11 and Windows 95 / 98 / ME:
   files through Device Manager), USB devices in their own Device Manager classes (USB,
   Keyboard, Mouse, HID, sound, imaging, Disk drives), and the I/O Supervisor port driver
   `WINUSB.PDR` for the disks (32-bit drive letters) (§3b)
+* **USB WDM bridge** (Windows 98 / ME): every other USB device — printers, scanners,
+  serial adapters, modems, card readers with their own drivers, vendor devices — gets its
+  **own Windows driver** (the manufacturer's Windows 98 / ME driver or Windows' class
+  driver), through the WDM bus driver `WINUSBW.SYS` (§3c)
+* **Every partition gets a letter:** FAT12 / FAT16 / FAT32 partitions as DOS drives (FAT32
+  from MS-DOS 7.10 on), NTFS, exFAT, HPFS, Linux and HFS+ partitions as small read-only
+  placeholder drives labelled with their file system, so that the following letters stay
+  put; empty letter slots are hidden from DOS until a disk is plugged in
 
 WINUSB is one of the four WINDRV packages, each in its own repository and usable alone or
 together with the others:
@@ -49,7 +60,7 @@ together with the others:
 |---------|----------------|
 | **WINDISK**  | IDE, SATA AHCI and NVMe disks, IDE/AHCI CD/DVD drives, SD card readers and eMMC |
 | **WINUSB**   | USB host controllers and devices, PS/2 mouse and keyboard, touchpads, USB4 / Thunderbolt |
-| **WINAUDIO** | HD Audio, AC'97 and the Intel audio DSP (SST / SOF), General MIDI synthesizer |
+| **WINAUDIO** | HD Audio, AC'97 and the Intel audio DSP (SST / SOF), General MIDI synthesizer, Sound Blaster 16 emulation for DOS programs |
 | **WINUDF**   | the UDF file system (DVD, Blu-ray, packet-written CDs, UDF disks), read and write |
 
 ---
@@ -59,13 +70,14 @@ together with the others:
 | System | WINUSB |
 |--------|------|
 | MS-DOS 5.0 / 6.x | disks, keyboard, mouse (PS/2 path and INT 33h), touchpads, USB CD/DVD (MSCDEX), sound (`AUDTEST /USB`), USB4 / Thunderbolt (NVMe, docks) |
+| MS-DOS 7.0 / 7.1 / 8.0, FreeDOS | the same; FAT32 partitions on 7.1, 8.0 and FreeDOS; with Windows 95/98/ME installed too (MS-DOS mode, DOS boxes) |
 | Windows 1.0x | USB keyboard, disks (as letters), mouse (INT 33h) + wheel (cursor-key scrolling) |
 | Windows 2.x (real mode) | USB keyboard, disks (as letters), mouse (INT 33h / "Microsoft Mouse") + wheel (cursor-key scrolling) |
 | Windows/386 2.x | **does not work** (see "Known limitations") |
 | Windows 3.0 Real Mode | keyboard, mouse, touchpads, disks, camera, beeps (`WINBEEP.DRV`) |
 | Windows 3.0 Standard / 386 Enhanced Mode | everything (sound with the Multimedia Extensions) |
 | Windows 3.1, WfW 3.11 | everything |
-| Windows 95 / 98 / ME | everything, as Plug and Play devices: `WINUSB.VXD` + the IOS port driver `WINUSB.PDR` (32-bit drive letters), PS/2 keyboard, mouse and touchpads (§3b) |
+| Windows 95 / 98 / ME | everything, as Plug and Play devices: `WINUSB.VXD` + the IOS port driver `WINUSB.PDR` (32-bit drive letters), PS/2 keyboard, mouse and touchpads (§3b); Windows 98 / ME: the other USB devices with their own Windows drivers through the WDM bridge `WINUSBW.SYS` (§3c) |
 
 ## Repository layout
 
@@ -84,13 +96,17 @@ Files used by several systems are in each of their folders. The installer is run
 
 | Folder | Files |
 |--------|-------|
-| `bin/DOS` | `AUDTEST.EXE`, `DSKBENCH.EXE`, `INSTUSB.EXE`, `README.TXT`, `UNINUSB.EXE`, `WININFO.EXE`, `WINUCD.SYS`, `WINUCORE.BIN`, `WINUSB.SYS` |
+| `bin/DOS` | `AUDTEST.EXE`, `DSKBENCH.EXE`, `INSTUSB.EXE`, `MANUAL.TXT`, `README.TXT`, `UNINUSB.EXE`, `WININFO.EXE`, `WINUCD.SYS`, `WINUCORE.BIN`, `WINUSB.SYS` |
 | `bin/WIN3X` | `OEMSETUP.INF`, `USBTREE.EXE`, `WIN30FIX.COM`, `WINBEEP.DRV`, `WINCAM.EXE`, `WINGRP.EXE`, `WINMIX.EXE`, `WINMOUSE.DRV`, `WINSOUND.DRV`, `WINUSB.386`, `WINUSB.TXT`, `WINWHEEL.EXE` |
-| `bin/WIN9X` | `USBTREE.EXE`, `WIN4G.VXD`, `WINCAM.EXE`, `WINDRVCI.DLL`, `WINGRP.EXE`, `WINKBD.INF`, `WINMIX.EXE`, `WINMOU.INF`, `WINMOUSE.DRV`, `WINSOUND.DRV`, `WINUSB.INF`, `WINUSB.PDR`, `WINUSB.TXT`, `WINUSB.VXD`, `WINUSBA.INF`, `WINUSBD.INF`, `WINUSBH.INF`, `WINUSBS.INF`, `WINUSBV.INF`, `WINWHEEL.EXE` |
+| `bin/WIN9X` | `USBD.SYS`, `USBTREE.EXE`, `WIN4G.VXD`, `WINCAM.EXE`, `WINDRVCI.DLL`, `WINGRP.EXE`, `WINKBD.INF`, `WINMIX.EXE`, `WINMOU.INF`, `WINMOUSE.DRV`, `WINSOUND.DRV`, `WINUSB.INF`, `WINUSB.PDR`, `WINUSB.TXT`, `WINUSB.VXD`, `WINUSBA.INF`, `WINUSBD.INF`, `WINUSBH.INF`, `WINUSBS.INF`, `WINUSBV.INF`, `WINUSBW.SYS`, `WINWHEEL.EXE` |
 
 ## 1. Requirements
 
-* Pentium or later processor (TSC), MS-DOS 5.0 / 6.x, **HIMEM.SYS**, PCI bus
+* Pentium or later processor with a time stamp counter (also SoCs that have one but do not
+  report it through CPUID, such as the Vortex86 DX / SX / EX), MS-DOS 5.0 / 6.x / 7.x / 8.0
+  or FreeDOS, **HIMEM.SYS** (or another XMS driver: JEMMEX, HIMEMX; with or without
+  EMM386 / JEMM386), PCI bus. The DOS driver can be loaded high (`DEVICEHIGH`) or with a
+  device loader such as DEVLOAD.
 * Windows (optional):
   * **3.0, 3.1, WfW 3.11:** everything (sound on Windows 3.0 needs the Multimedia
     Extensions)
@@ -122,21 +138,24 @@ Files used by several systems are in each of their folders. The installer is run
 | `AUDTEST.EXE`  | DOS | sound device list, test tone, WAV play / record, MIDI test (`AUDTEST /USB`) |
 | `INSTUSB.EXE`  | DOS | installer |
 | `UNINUSB.EXE`  | DOS | uninstaller |
-| `README.TXT`   | DOS | this text (code page 437) |
+| `README.TXT`   | DOS | the short README (code page 437) |
+| `MANUAL.TXT`   | DOS | this manual (code page 437) |
 | `WINUSB.386`   | WIN3X | Windows 386 Enhanced Mode VxD, in the directory of WINUSB.SYS (loaded automatically) |
 | `WINMOUSE.DRV` | WIN3X, WIN9X | Windows mouse driver: USB + PS/2, wheel, back / forward buttons, tablets |
 | `WINWHEEL.EXE` | WIN3X, WIN9X | passes the wheel / horizontal wheel to programs, autoscroll |
 | `USBTREE.EXE`  | WIN3X, WIN9X | USB tree, descriptors, disks, log, safe removal, report |
 | `WINCAM.EXE`   | WIN3X, WIN9X | USB camera picture, photos, video |
-| `WINSOUND.DRV` | WIN3X, WIN9X | MMSYSTEM sound driver (wave, MIDI, aux) for USB Audio devices |
+| `WINSOUND.DRV` | WIN3X, WIN9X | MMSYSTEM sound driver (wave, MIDI, aux, mixer) for USB Audio devices |
 | `WINMIX.EXE`   | WIN3X, WIN9X | volume levels / recording source |
 | `WINBEEP.DRV`  | WIN3X | Windows 3.0 SOUND driver: beeps and the `PLAY` / `SOUND` API in Real Mode too |
 | `WIN30FIX.COM` | WIN3X | XMS fix for Windows 3.0 Standard Mode with more than 16 MB of memory |
 | `OEMSETUP.INF` | WIN3X | for installing the mouse driver with Windows Setup |
 | `WINGRP.EXE`   | WIN3X, WIN9X | creates the Program Manager / Start menu group at the next start of Windows |
-| `WINUSB.TXT`   | WIN3X, WIN9X | this text for Notepad ("Read Me" item of the group) |
+| `WINUSB.TXT`   | WIN3X, WIN9X | this manual for Notepad ("Read Me" item of the group) |
 | `WINUSB.VXD`   | WIN9X | Windows 95/98/ME Plug and Play VxD (from SYSTEM.INI at boot; DevLoader and USB enumerator) |
 | `WINUSB.PDR`   | WIN9X | I/O Supervisor port driver: USB disks, CD/DVD drives and NVMe (`SYSTEM\IOSUBSYS`) |
+| `WINUSBW.SYS`  | WIN9X | Windows 98 / ME: WDM bus driver of the USB WDM bridge (`SYSTEM32\DRIVERS`, §3c) |
+| `USBD.SYS`     | WIN9X | Windows 98 / ME: the USB descriptor helpers Windows drivers import; installed only where Windows' own USBD.SYS is missing (§3c) |
 | `WINUSB.INF`   | WIN9X | host controllers (UHCI / OHCI / EHCI / xHCI / USB4), hubs, other USB devices (Universal Serial Bus controllers) |
 | `WINKBD.INF`   | WIN9X | USB and PS/2 keyboards (Keyboard) |
 | `WINMOU.INF`   | WIN9X | USB and PS/2 mice and touchpads (Mouse) |
@@ -161,7 +180,7 @@ INSTUSB D:\DRV\WIN /W:D:\WIN  another directory and Windows directory
 INSTUSB /NOWIN               the DOS driver only (no mouse / wheel / sound settings)
 INSTUSB /NOSOUND             WINSOUND.DRV (USB sound) is not installed
 INSTUSB /O /R:4              with driver options (everything after /O goes to WINUSB.SYS)
-INSTUSB /DOS                 MS-DOS 7 (Windows 95/98): adds WINUSB.SYS to CONFIG.SYS too
+INSTUSB /DOS                 Windows 95/98 installed: adds WINUSB.SYS to CONFIG.SYS too
 ```
 
 INSTUSB finds every Windows installation of the machine (1.0x to 3.11 and 95 / 98 / ME) and
@@ -247,9 +266,11 @@ boot disk on the 32-bit path too. Installation:
 1. Run `INSTUSB` from `bin\DOS` (in DOS or in a DOS box). It recognizes Windows 9x, copies
    `WINUSB.VXD`, `WIN4G.VXD`, `WINDRVCI.DLL`, `WINMOUSE.DRV`, `WINSOUND.DRV`,
    `WINWHEEL.EXE`, `USBTREE.EXE`, `WINCAM.EXE` and `WINMIX.EXE` to `WINDOWS\SYSTEM`,
-   `WINUSB.PDR` to `WINDOWS\SYSTEM\IOSUBSYS` and the INF files to `WINDOWS\INF` (without
+   `WINUSB.PDR` to `WINDOWS\SYSTEM\IOSUBSYS`, on Windows 98 / ME `WINUSBW.SYS` (and
+   `USBD.SYS` when Windows has none) to `WINDOWS\SYSTEM32\DRIVERS` (§3c), the INF files to
+   `WINDOWS\INF` (without
    their `CopyFiles` lines: the files are in place already, so Windows does not ask for a
-   disk for each), and sets `mouse.drv=winmouse.drv`, `[drivers] wave= / midi=winsound.drv`,
+   disk for each), and sets `mouse.drv=winmouse.drv`, `[drivers] wave= / midi= / mixer=winsound.drv`,
    `device=win4g.vxd` and `device=winusb.vxd` in SYSTEM.INI and `load=winwheel.exe` in
    WIN.INI. Files Windows keeps open (an older WINUSB.VXD, say) are replaced at the next
    boot through `WININIT.INI`.
@@ -337,10 +358,16 @@ How it works:
   controller installed while Windows runs gets the SYSTEM.INI options at the next boot.
   With `/D` the VxD and the PDR log to port 0E9h (QEMU `-debugcon`) and COM1 if there is one.
 * **The DOS driver on Windows 9x:** with `INSTUSB /DOS`, `WINUSB.SYS` goes into CONFIG.SYS
-  too (keyboard, mouse and disks in Windows 95/98 "DOS mode"). On MS-DOS 7 the DOS driver
-  gives **no drive letters** by default (`/DOSDISK` makes it do so) and does not load the
-  VxD through SIS when Windows starts: Windows' Plug and Play VxD and port driver take the
-  disks, the DOS core lets go of the hardware.
+  too (keyboard, mouse and disks in MS-DOS mode, the DOS boxes and before Windows starts).
+  Its drive letters are there on MS-DOS 7.x with Windows 95/98/ME installed too; when Windows
+  starts they are hidden (Windows' Plug and Play VxD and port driver take the disks, the DOS
+  core lets go of the hardware and does not load the VxD through SIS). The installer adds
+  WINUSB.SYS to the `[SafeList]` of `WINDOWS\IOS.INI`, so Windows 98 does not report the
+  drives as running in "MS-DOS compatibility mode" ("Performance Warning"). `/DOSDISK`, which
+  earlier versions needed for this, is accepted and does nothing.
+* **Static start:** `WINUSB.VXD` loaded at boot starts only the USB controllers whose
+  installed driver (Device Manager) is WINUSB; controllers that have Windows' own UHCI /
+  OHCI / EHCI driver are left to it (both drivers on one controller freeze the machine).
 * Thunderbolt / USB4: when the NHI devnode is given to WINUSB.VXD the tunnels are set up as
   in DOS; the xHCI / NVMe functions behind a tunnel are driven by WINUSB directly (the PCI
   enumerator of Windows 9x knows nothing of PCIe hot plug; these devices do not appear in
@@ -350,11 +377,63 @@ How it works:
   mode") while SeaBIOS uses a USB keyboard or mouse it saw at boot: SeaBIOS's USB HID code
   in the timer interrupt cannot run in V86 mode. That is specific to QEMU.
 
+### 3c. Other USB devices on Windows 98 / ME: the WDM bridge
+
+Windows 98 and ME bring Windows Driver Model (WDM) drivers for USB devices — HID devices,
+printers (USBPRINT), scanners (USBSCAN), modems, Windows ME's mass storage driver
+(USBSTOR) — and most USB devices sold for Windows 98 / ME came with WDM drivers of their
+own. These drivers need Windows' USB stack below them. WINUSB gives them one: every USB
+device (or interface of a composite device) that no WINDRV class driver serves is handed to
+`WINUSBW.SYS`, a WDM bus driver, which reports it to Windows exactly as Windows' own USB hub
+driver would:
+
+* device id `USB\VID_xxxx&PID_yyyy` (with `&MI_nn` for one interface of a composite
+  device), hardware ids with `&REV_zzzz`, compatible ids `USB\Class_cc&SubClass_ss&Prot_pp`,
+  `USB\Class_cc&SubClass_ss`, `USB\Class_cc`; the product string as the name
+* Windows then finds the device's INF (the manufacturer's driver disk, or one of its own
+  INF files) and loads the driver on top; "New Hardware Found" works as with Windows' own
+  USB controllers
+* the driver's USB requests (URBs) are carried out by WINUSB.VXD on its host controller
+  drivers: select configuration / interface, control transfers (standard, class, vendor
+  requests of every recipient), bulk and interrupt transfers of any length (in 64 KB
+  pieces), reset / abort pipe, frame number, port status / reset; cancelled requests are
+  taken off the controller
+* unplugging removes the device (its driver gets the removal from the PnP manager); a
+  device plugged in again is reported anew
+
+Installation: `WINUSB.INF` has the entry "WINUSB USB WDM Bridge (Windows drivers of USB
+devices)" (`WINUSB\WDMBUS`, under the first USB controller, Universal Serial Bus
+controllers). WINUSB.VXD creates that devnode on Windows 98 and ME; Windows installs it
+from the INF database by itself (the installer copies `WINUSBW.SYS` to
+`WINDOWS\SYSTEM32\DRIVERS`). Drivers such as HIDUSB.SYS import a few helper functions from
+`USBD.SYS`, which comes with Windows' own USB controller drivers; on a machine whose
+controllers have only ever had WINUSB it is missing, so WINUSB brings a `USBD.SYS` with
+those functions (descriptor parsing, configuration requests) and installs it only where
+there is none (never over Windows' own, and the uninstaller leaves it).
+
+Which devices go to the bridge: those WINUSB has no class driver for (vendor class
+devices, printers, scanners, serial adapters, modems, …), and the interfaces of composite
+devices WINUSB leaves unclaimed. HID devices, hubs, mass storage, USB Audio and cameras stay
+with WINUSB's own drivers. `[WINUSB]` in SYSTEM.INI (read at boot):
+
+| Entry | Meaning |
+|-------|---------|
+| `WDM=vvvv:pppp,...` | these devices (vendor:product id, hexadecimal; `vvvv:*` every device of the vendor) go to their Windows driver even though WINUSB has a class driver for them (a mass storage device for Windows ME's USBSTOR, a sound device with its own driver, …) |
+| `WDM=OFF` | no bridge: the devices are shown as "WINUSB USB Device (no WINDRV class driver)" as before |
+
+Limits: isochronous transfers (webcams and audio devices of WDM drivers) are not
+supported. HID mice and keyboards given to Windows' HID drivers with `WDM=` need VMOUSE
+(Windows' mouse driver with `MSMOUSE.VXD`), which WINUSB replaces with its own mouse
+driver: keep them with WINUSB. Windows 95 (no WDM) keeps the "no WINDRV class driver"
+devnodes. Tried in QEMU: a USB tablet with Windows 98's HIDUSB / HIDCLASS (and plugging
+it out and in again), a USB disk with Windows ME's USBSTOR (reading, writing, Explorer
+listing the drive).
+
 ### Options
 
 | Option | Meaning |
 |--------|---------|
-| `/R:n`   | drive letters reserved for USB disks (20 at most). By default at least 4, more when the removable disks plugged in at boot have more FAT partitions (plus one spare); WINUSB then waits for the USB devices at boot |
+| `/R:n`   | drive letters reserved for USB disks (20 at most). By default at least 2, more when the removable disks plugged in at boot have more FAT partitions (plus one spare); WINUSB then waits for the USB devices at boot |
 | `/WIN`   | USB only in Windows 386 Enhanced Mode (off in DOS) |
 | `/NOMSC` | no mass storage |
 | `/NOHID` | no keyboard / mouse |
@@ -376,7 +455,7 @@ How it works:
 | `/NOTBUSB` | no USB3 tunnels on USB4 links |
 | `/PCIHP` | watch every hot-plug capable PCIe port, Thunderbolt or not (ExpressCard, PCIe slots) |
 | `/NVME`, `/NONVME` | NVMe controllers behind tunnels: also take over the one the BIOS started / never use them |
-| `/DOSDISK` | MS-DOS 7: drive letters from the DOS driver too |
+| `/DOSDISK` | accepted for compatibility, no effect: the DOS driver gives drive letters with Windows 95/98/ME installed too |
 
 ## 4. How it works
 
@@ -395,11 +474,36 @@ How it works:
   tip switch = left, barrel / eraser = right) move the Windows pointer straight to the screen
   position (WINMOUSE.DRV absolute mode; Enhanced and Standard Mode). In DOS the absolute
   position becomes relative PS/2 motion.
-* **Letters:** `/R:n` slots are reserved (at least 4 by default, more with the partitions
+* **Letters:** `/R:n` slots are reserved (at least 2 by default, more with the partitions
   found at boot); a device is matched by serial number / VID / PID / partition and gets the
   same letter when it comes back. Removal is reported to DOS as a media change. On
-  multi-partition disks (MBR primary and extended partitions, GPT) **every partition** gets
-  its own slot. On Windows 95/98/ME Windows gives the letters; all partitions appear.
+  multi-partition disks (MBR primary and extended partitions, GPT, superfloppies) **every
+  partition** gets its own slot, whatever its file system: FAT12 / FAT16 / FAT32 as DOS
+  drives (FAT32 needs MS-DOS 7.10 or later; on older versions it is shown like the
+  following), NTFS, exFAT, HPFS, Linux (ext2/3/4) and HFS+ as small read-only placeholder
+  drives whose volume label names the file system (`DIR` shows "Volume in drive H is NTFS",
+  writing gives "Write protect error"), so that the letters of the following partitions
+  stay the same. FAT32 drives answer the FAT32 generic IOCTL (category 48h) and report
+  "FAT32" in their media ID. On Windows 95/98/ME Windows gives the letters; all partitions
+  appear.
+* **Empty slots** are hidden from DOS: the Current Directory Structure entry of a slot
+  without a disk is marked invalid until a disk comes, so `DIR X:` says "Invalid drive
+  specification" and programs that look at every drive (installers, file managers, games
+  such as Fox Hunt) no longer get "Not ready reading drive", "General failure reading drive
+  X" or "Current drive is no longer valid". A letter that another driver took in the
+  meantime (MSCDEX / SHSUCDX, SUBST, network) is left alone.
+* **Loaded high:** WINUSB.SYS, WINDISK.SYS and WINAUDIO.SYS can be loaded with `DEVICEHIGH`
+  (and with DEVLOAD or other device loaders, from any directory). Loaded into an upper
+  memory block, WINUSB reads the first sectors of the BIOS disks twice (into its block and
+  into the HMA), because BIOS code that writes to physical memory (32-bit, SMM or USB code)
+  misses a block the memory manager maps from elsewhere; the BIOS USB disks are recognized
+  either way. Under VCPI servers that emulate A20 by paging (JEMM, EMM386) the HMA is mapped
+  as itself in the core, so transfers into DOS buffers in the HMA (DOS=HIGH) land there.
+* **USB boot disks:** a USB disk the BIOS booted from (or offered as a BIOS drive) stays
+  reachable after WINUSB took the controller from the BIOS: its INT 13h calls (CHS and
+  extended reads / writes, geometry) are served by WINUSB.SYS, in Windows 3.x by the VxD.
+  Before 1.1 such a disk was lost once the driver started (DOS asked for `WINUCD.SYS` and
+  other files again, "Not ready reading drive C").
 * **PS/2 mouse:** WINUSB drives the auxiliary port of the 8042 itself (in DOS through the
   BIOS's INT 15h C2h interface, in Windows 3.x Enhanced Mode and Windows 9x with IRQ 12):
   IntelliMouse Explorer mode (4-byte packets, wheel, buttons 4 and 5). On Windows 9x the VxD
@@ -423,6 +527,9 @@ of Windows 1.0x–3.11 and Windows 95/98/ME.
 | two fingers up / down | wheel (one notch per 2.5 mm; fingers down -> page down) |
 | two fingers left / right | horizontal wheel |
 | short tap | left click; two fingers: right click; three fingers: middle click |
+| two taps | double click (each tap is a click of its own) |
+| tap, then touch again and move | drag (the button stays down until the finger lifts) |
+| three fingers left / right | back / forward (buttons 4 and 5: Alt+Left / Alt+Right) |
 | touchpad button / clickpad | left click; right click while two fingers touch |
 | TrackPoint | pointer; scrolling while the middle button is held, a middle click on its own |
 
@@ -578,6 +685,13 @@ the first tries on real Thunderbolt / USB4 hardware take a log with `/D /S`.
   device number and settings. MMSYSTEM reads the number of devices only at start, so
   WINSOUND.DRV keeps room for up to 2 USB sound devices plugged in while Windows runs ("WIN
   USB Audio 1/2"); a device plugged in later is bound to those. WINMIX updates its list live.
+  With WINAUDIO installed too, the Sound Blaster 16 emulation of WINAUDIO plays on the first
+  USB Audio output when the machine has no other sound device (WINAUDIO's `/USBSB`: always),
+  in DOS (WINUSB.SYS `/USB` loaded before WINAUDIO.SYS), in Windows 3.x and in Windows
+  95 / 98 / ME (WINAUDIO manual §3b).
+  On Windows 95 / 98 / ME the devices present at the start of Windows also get a mixer
+  (Volume Control, the volume icon of the taskbar); the volumes are kept in SYSTEM.INI
+  `[winsound.drv]` across restarts.
 * **DOS:** `AUDTEST /USB` plays and records in DOS too (WINSOUND.DRV uses the same path in
   Standard Mode). In Standard Mode and DOS packets are scheduled 150 ms ahead, in Enhanced
   Mode 40 ms.
@@ -714,6 +828,7 @@ Source files and documents are stored with CRLF line ends; `.gitattributes` keep
 | `src/dos` | DOS: WINUSB.SYS (NASM), the DOS platform layer of the core, WINUCD.SYS, WIN30FIX.COM |
 | `src/vxd` | Windows 3.x Enhanced Mode and Windows 95/98/ME: the VxD platform layer and entries, PS/2 mouse (`ps2.c`), Plug and Play, WIN4G.VXD |
 | `src/pdr` | Windows 95/98/ME: the I/O Supervisor port driver WINUSB.PDR |
+| `src/wdm` | Windows 98/ME: the WDM bus driver WINUSBW.SYS of the USB WDM bridge (`core/usbwdm.c` is its VxD side) |
 | `src/inf` | Windows 95/98/ME: the INF files |
 | `src/win` | Windows (16-bit, 3.x and 9x): WINMOUSE.DRV, WINWHEEL, USBTREE, WINCAM, WINSOUND.DRV, WINBEEP.DRV, WINMIX, WINGRP, WINDRVCI.DLL |
 | `src/tools` | DOS programs: installer / uninstaller (`winsetup.c`), WININFO, DSKBENCH, AUDTEST; generators of cursors and GPIO tables |
@@ -758,8 +873,9 @@ taken over, class icons, booting from a USB stick, USB CD/DVD).
 * **Windows/386 2.x** switches the processor to V86 mode without offering VCPI; while it runs
   the 32-bit core cannot be entered and the driver serves no requests. The real-mode
   Windows 2.x (`WIN86.COM` / `WIN.COM`) works.
-* **DOS file systems:** DOS 5 / 6 read only FAT12 / FAT16 (2 GB per partition at most);
-  FAT32, NTFS, exFAT ... partitions get no drive letter.
+* **DOS file systems:** MS-DOS 5 / 6 read only FAT12 / FAT16 (2 GB per partition at most);
+  MS-DOS 7.10 / 8.0 and FreeDOS read FAT32 too; NTFS, exFAT ... partitions get no drive
+  letter.
 * **SeaBIOS (QEMU only):** when SeaBIOS uses a USB keyboard or mouse at boot, its USB polling
   in SMM can stop the machine while Windows 2.x starts, and DOS boxes of Windows 95/98/ME
   close. Real BIOSes hand the controllers over properly (BIOS / OS semaphore, SMIs off).
@@ -796,9 +912,51 @@ taken over, class icons, booting from a USB stick, USB CD/DVD).
   Windows 3.0 Real Mode 640×480 NV12 does not fit into memory.
 * **Windows 95 / 98 / ME:** USB sound / MIDI and cameras only through WINSOUND.DRV and WINCAM
   (no DirectSound / VFW). A Windows booted from a USB stick cannot reach that disk through the
-  BIOS after shutdown ("It's now safe..." screen, "Restart in MS-DOS mode").
+  BIOS after shutdown ("It's now safe..." screen, "Restart in MS-DOS mode"). The WDM bridge
+  (§3c) has no isochronous transfers.
+* **BIOS legacy USB support:** WINUSB takes the controllers over from the BIOS (the
+  ownership handshake of EHCI / xHCI, the legacy registers of UHCI) whether "Legacy USB
+  support" is on or off in the BIOS setup. A BIOS that does not answer the handshake within a
+  second is overruled; its keyboard emulation (port 60h / 64h traps in SMM) may then keep
+  running and disturb the PS/2 keyboard of a notebook. If that happens, turn "Legacy USB
+  support" off, or try `/NOKBC` and `/NOTP`, and send the log of `WINUSB.SYS /D /S`.
 
 ## Version history
+
+**1.1 (26 October 2026)**
+
+Changelog:
+
+- Added the USB WDM bridge for Windows 98 / ME: the USB devices (and the interfaces of composite devices) no WINDRV class driver serves are reported by the new WDM bus driver `WINUSBW.SYS` as `USB\VID_xxxx&PID_xxxx` devices, so their own Windows drivers load (vendor drivers, Windows' HID, printer and other class drivers) and their USB requests run on WINUSB's controllers; `[WINUSB] WDM=vvvv:pppp` in SYSTEM.INI gives a device to its Windows driver even when WINUSB knows its class, `WDM=OFF` turns the bridge off.
+- Drive letters for every partition of a USB disk, whatever its file system: FAT12 / FAT16 / FAT32 partitions as DOS drives (FAT32 on MS-DOS 7.10 and later), NTFS, exFAT, HPFS, Linux (ext2/3/4), HFS+ partitions and FAT32 on older DOS versions as small read-only placeholder drives labelled with the file system, so that the letters of the following partitions do not shift.
+- Empty drive letter slots are hidden from DOS until a disk is plugged in: no more "Not ready reading drive", "General failure reading drive", "Current drive is no longer valid" or "Cannot read from drive" in programs that walk all drives; letters of other drivers (MSCDEX, SHSUCDX, SUBST, network) are left alone.
+- MS-DOS 7.x with Windows 98 / ME installed: the DOS driver gives drive letters too (`/DOSDISK` is no longer needed); the installer adds WINUSB.SYS to the `[SafeList]` of IOS.INI, so Windows 98 no longer warns that a drive uses MS-DOS compatibility mode.
+- FAT32 drives answer the FAT32 generic IOCTL (category 48h) and report "FAT32" in their media ID.
+- Fixed transfers into the HMA (DOS=HIGH buffers) under VCPI servers that emulate A20 by paging (JEMM): corrupt directory listings (only the first entry shown, lost clusters), frozen keyboard.
+- WINUSB.SYS can be loaded high (`DEVICEHIGH`): a USB disk the BIOS also offers is recognized from an upper memory block too (its first sector is read into the HMA as well, where BIOS USB code writes), so its BIOS drive keeps working once WINUSB has the controller (the machine hung at the first access to such a drive).
+- Windows 98 / ME: USB CD/DVD drives no longer lose the disc for a moment when the drive is busy (CD Player).
+- Windows 95/98/ME: WINUSB.VXD loaded at the start takes only the USB controllers whose installed driver is WINUSB (Windows' own UHCI / OHCI driver on the other controllers starts them too; freezes on machines such as the ThinkPad T42p with WINUSB on one of several controllers).
+- Fixed the BIOS drives of Windows 9x not being matched to their USB disks when a FAT16 drive gives its size in the 32-bit field of the BPB.
+- Added the audio functions of USB CD/DVD drives for MSCDEX (play, pause, resume, stop, Q-channel, UPC, audio status) and SCSI commands with data to the drive (MODE SELECT).
+- Safe removal (WININFO /E, USBTREE): sticks without a write cache, which reject SYNCHRONIZE CACHE, no longer report "Flush failed".
+- Added Thunderbolt 5 / USB4 version 2 routers and the host interfaces of Lunar Lake, Panther Lake, Wildcat Lake and Barlow Ridge.
+- Fixed "CPU without time stamp counter" on CPUs that have one but do not report it through CPUID (Vortex86 DX / SX / EX …).
+- The TSC rate is measured with a time limit and with the PIT counter when the timer interrupt does not come (freezes at the start under some VCPI servers).
+- WINUSB.SYS loaded with DEVLOAD or another device loader finds WINUCORE.BIN in its own directory.
+- The installer tells Windows 98, 98 Second Edition and ME apart by the version of USER.EXE (Windows 98 was shown as Windows 95).
+- Fixed lost Shift releases (a stuck Shift key) and missing number keys with PS/2 and USB keyboards in DOS and Windows.
+- Fixed the PS/2 mouse, touchpads and trackpads not working on some machines, and double clicks.
+- Added touchpad gestures: double tap, tap and drag, three-finger swipe for back / forward (PS/2, SMBus, I2C and USB touchpads); TrackPoint scrolling with the middle button (up / down and left / right).
+- PS/2 mice: the wheel scrolls up / down and the 4th / 5th buttons go back / forward on every Windows version (IntelliMouse Explorer mode).
+- Added USB keyboards that work only in report protocol.
+- The USB keyboard works inside DOS functions too (COPY CON, programs reading the console through DOS).
+- Fixed USB boot disks being lost in DOS once WINUSB.SYS started ("Bad or missing ...\WINUCD.SYS", "Not ready reading drive"): their INT 13h calls are served by the driver.
+- Added MS-DOS 7.0, 7.1, 8.0 and FreeDOS support: drive letters (FAT32 on 7.10 / 8.0 and FreeDOS); the installer adds the CONFIG.SYS lines there too.
+- 2 drive letter slots by default instead of 4.
+- WINBEEP.DRV plays the system sounds of WIN.INI [sounds] in Windows 3.0 Real Mode; WINSOUND.DRV no longer repeats the first 64 KB of long sounds.
+- WINSOUND.DRV: a mixer driver for Windows 95/98/ME (`mixer=winsound.drv`, Volume Control and the volume icon of the taskbar), the volumes are kept across restarts (SYSTEM.INI `[winsound.drv]`), USB Audio volume follows the Windows scale (half volume is -6 dB), removed USB Audio devices no longer accept format queries; synthesizer instruments without the harsh noise of strong feedback, fuller basses, softer high notes, no tick at note starts.
+- USB Audio devices play WINAUDIO's Sound Blaster 16 emulation (DOS, Windows 3.x MS-DOS boxes, Windows 95/98/ME) when WINAUDIO is installed too.
+- The documentation is split into README.md (overview, installation) and MANUAL.md (all details).
 
 **1.0 (5 October 2026)** — first release.
 

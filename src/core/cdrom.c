@@ -30,6 +30,7 @@
 #define DS_RAW      0x0004
 #define DS_REDBOOK  0x0200
 #define DS_NODISC   0x0800
+#define DS_PLAYING  0x0400      /* audio play in progress (as DOSBox reports it) */
 
 struct cdrom {
     struct blkdev bd;
@@ -44,6 +45,9 @@ struct cdrom {
     u32 head;               /* last position, for IOCTL "location of head" */
     u32 checked;            /* plat_ms() of the last TEST UNIT READY */
     u8 *small;              /* 256 bytes of pool memory */
+    u8 paused;              /* audio: paused by STOP AUDIO (DOS) */
+    u8 fails;               /* TEST UNIT READY failures in a row without "medium not present" */
+    u32 pstart, pend;       /* audio: the last PLAY AUDIO (HSG, end exclusive) */
 };
 
 /* slot i is DOS unit i of the CD-ROM device: a slot keeps its number while the other
@@ -114,14 +118,21 @@ static int cd_ready(struct cdrom *cd, int force)
         if (r != 1 || cd->key != 0x06) break;
     }
     if (r) {
+        /* a medium is gone when the drive says so (NOT READY, medium not present) or after a
+           few failures in a row: a drive busy with audio (CD players poll while the disc
+           plays) or becoming ready answers BUSY / NOT READY now and then, and the disc must
+           not vanish and come back for that */
+        if (cd->media && !(r == 1 && cd->key == 0x02 && cd->asc == 0x3A) && ++cd->fails < 3) return 0;
         if (cd->media) {
             cd->changed = 1;
             cd->gen++;
         }
+        cd->fails = 0;
         cd->media = 0;
         cd->bd.present = 0;
         return -2;
     }
+    cd->fails = 0;
     if (!cd->media) {
         if (read_capacity(cd)) return -2;
         cd->media = 1;
@@ -264,11 +275,16 @@ int cd_media(struct blkdev *d)
 int cd_command(struct blkdev *d, const u8 *cdb, void *buf, u32 len, u8 *sense)
 {
     struct cdrom *cd = cd_of(d);
+    u32 out = len & CDP_OUT;
     int r;
+    len &= ~CDP_OUT;
     if (!cd || len > BOUNCE_SIZE) return -1;
-    if (len) memset(bounce, 0, len);
-    r = cmd(cd, cdb, len ? bounce : NULL, len, 20000);
-    if (r == 0 && len) memcpy(buf, bounce, len);
+    if (len) {
+        if (out) memcpy(bounce, buf, len);
+        else memset(bounce, 0, len);
+    }
+    r = cmd(cd, cdb, len ? bounce : NULL, len | out, 20000);
+    if (r == 0 && len && !out) memcpy(buf, bounce, len);
     if (r == 1 && sense) {
         memset(sense, 0, 18);
         sense[0] = 0x70;
@@ -349,6 +365,54 @@ static int read_toc(struct cdrom *cd, u8 track)
     return (int)(((cd->small[0] << 8) | cd->small[1]) + 2);
 }
 
+/* READ SUB-CHANNEL (MSF) into cd->small: format 1 current position, 2 media catalog number;
+   returns the audio status (11h playing, 12h paused, 13h completed, ...) or -1 */
+static int subq(struct cdrom *cd, u8 format)
+{
+    u8 c[12];
+    memset(c, 0, sizeof(c));
+    c[0] = 0x42;
+    c[1] = 0x02;                /* MSF */
+    c[2] = 0x40;                /* Q sub-channel data */
+    c[3] = format;
+    c[8] = 24;
+    memset(cd->small, 0, 24);
+    if (cmd(cd, c, cd->small, 24, 5000)) return -1;
+    return cd->small[1];
+}
+
+/* an audio play is going on (busy bit of the requests) */
+static int audio_busy(struct cdrom *cd)
+{
+    return cd->media && !cd->paused && cd->pend && subq(cd, 1) == 0x11;
+}
+
+/* PLAY AUDIO MSF from start for n sectors (HSG) */
+static int play(struct cdrom *cd, u32 start, u32 n)
+{
+    u8 c[12];
+    u32 a = hsg2rb(start), b = hsg2rb(start + n);
+    memset(c, 0, sizeof(c));
+    c[0] = 0x47;
+    c[3] = (u8)(a >> 16);
+    c[4] = (u8)(a >> 8);
+    c[5] = (u8)a;
+    c[6] = (u8)(b >> 16);
+    c[7] = (u8)(b >> 8);
+    c[8] = (u8)b;
+    return cmd(cd, c, NULL, 0, 10000);
+}
+
+/* PAUSE / RESUME */
+static int pause_resume(struct cdrom *cd, int resume)
+{
+    u8 c[12];
+    memset(c, 0, sizeof(c));
+    c[0] = 0x4B;
+    c[8] = (u8)(resume ? 1 : 0);
+    return cmd(cd, c, NULL, 0, 5000);
+}
+
 static u32 msf(const u8 *p)
 {
     return ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
@@ -370,6 +434,7 @@ static int ioctl_in(struct cdrom *cd, u8 *pkt)
         u32 st = DS_RAW | DS_REDBOOK;
         cd_ready(cd, 0);
         if (!cd->locked) st |= DS_UNLOCKED;
+        if (audio_busy(cd)) st |= DS_PLAYING;
         if (!cd->media) {
             st |= DS_NODISC;
             if (cd->key == 0x02 && cd->asc == 0x3A && cd->ascq == 0x02) st |= DS_DOOROPEN;
@@ -413,8 +478,39 @@ static int ioctl_in(struct cdrom *cd, u8 *pkt)
             }
         return ST_ERR | ST_DONE | E_NOTFOUND;
     }
-    case 15:                    /* audio status: not paused, no play range */
+    case 12:                    /* audio Q-channel: track, index, times */
+        if (cd_ready(cd, 0) || subq(cd, 1) < 0) return ST_ERR | ST_DONE | E_NOTREADY;
+        c[1] = (u8)((cd->small[5] << 4) | (cd->small[5] >> 4));     /* CONTROL and ADR */
+        c[2] = cd->small[6];
+        c[3] = cd->small[7];
+        c[4] = cd->small[13];   /* running time in the track */
+        c[5] = cd->small[14];
+        c[6] = cd->small[15];
+        c[7] = 0;
+        c[8] = cd->small[9];    /* on the disc */
+        c[9] = cd->small[10];
+        c[10] = cd->small[11];
+        return ST_DONE;
+    case 14:                    /* UPC / EAN (media catalog number) */
+        if (cd_ready(cd, 0) || subq(cd, 2) < 0) return ST_ERR | ST_DONE | E_NOTREADY;
+        c[1] = (u8)((cd->small[5] << 4) | (cd->small[5] >> 4));
+        if (!(cd->small[8] & 0x80)) return ST_ERR | ST_DONE | E_NOTFOUND;
+        {
+            /* 13 ASCII digits -> 7 bytes of BCD */
+            int i;
+            for (i = 0; i < 7; i++) {
+                u8 hi = cd->small[9 + 2 * i], lo = i < 6 ? cd->small[10 + 2 * i] : '0';
+                c[2 + i] = (u8)(((hi - '0') << 4) | ((lo - '0') & 15));
+            }
+        }
+        c[9] = 0;
+        c[10] = 0;
+        return ST_DONE;
+    case 15:                    /* audio status: paused, the range of the last play */
         memset(c + 1, 0, 10);
+        c[1] = cd->paused;
+        *(u32 *)(c + 3) = hsg2rb(cd->pstart);
+        *(u32 *)(c + 7) = hsg2rb(cd->pend);
         return ST_DONE;
     case 5:                     /* drive bytes */
         c[1] = 0;
@@ -513,8 +609,12 @@ int cd_dos_request(u8 *pkt)
     }
     switch (pkt[RH_CMD]) {
     case 3:                     /* IOCTL input */
-        setst(pkt, (u16)ioctl_in(cd, pkt));
+    {
+        u16 st = (u16)ioctl_in(cd, pkt);
+        if (cd->pend && !cd->paused && audio_busy(cd)) st |= ST_BUSY;
+        setst(pkt, st);
         return 0;
+    }
     case 12:                    /* IOCTL output */
         setst(pkt, (u16)ioctl_out(cd, pkt));
         return 0;
@@ -532,8 +632,60 @@ int cd_dos_request(u8 *pkt)
     case 128:                   /* read long */
         setst(pkt, (u16)read_long(cd, pkt));
         return 0;
+    case 132:                   /* play audio */
+    {
+        u32 st = *(u32 *)(pkt + 14), n = *(u32 *)(pkt + 18);
+        if (pkt[13] == 1) st = rb2hsg(st);
+        if (pkt[13] > 1) {
+            setst(pkt, ST_ERR | ST_DONE | E_BADCMD);
+            return 0;
+        }
+        if (cd_ready(cd, 0)) {
+            setst(pkt, ST_ERR | ST_DONE | (cd->changed ? E_BADCHG : E_NOTREADY));
+            return 0;
+        }
+        if (!n) {               /* nothing to play: only the position */
+            cd->head = st;
+            setst(pkt, ST_DONE);
+            return 0;
+        }
+        if (st + n > cd->blocks) n = st < cd->blocks ? cd->blocks - st : 0;
+        if (play(cd, st, n)) {
+            setst(pkt, ST_ERR | ST_DONE | sense_error(cd));
+            return 0;
+        }
+        cd->pstart = st;
+        cd->pend = st + n;
+        cd->paused = 0;
+        cd->head = st;
+        setst(pkt, ST_DONE | ST_BUSY);
+        return 0;
     }
-    /* audio play / stop / resume and the write commands are not supported */
+    case 133:                   /* stop audio: pause it, a second stop ends the play */
+        if (cd->paused || !audio_busy(cd)) {
+            u8 c[12];
+            memset(c, 0, sizeof(c));
+            c[0] = 0x4E;        /* STOP PLAY / SCAN */
+            cmd(cd, c, NULL, 0, 5000);
+            cd->paused = 0;
+            cd->pstart = cd->pend = 0;
+        } else {
+            pause_resume(cd, 0);
+            cd->paused = 1;
+        }
+        setst(pkt, ST_DONE);
+        return 0;
+    case 136:                   /* resume audio */
+        if (!cd->paused) {
+            setst(pkt, ST_ERR | ST_DONE | E_GENERAL);
+            return 0;
+        }
+        pause_resume(cd, 1);
+        cd->paused = 0;
+        setst(pkt, ST_DONE | ST_BUSY);
+        return 0;
+    }
+    /* the write commands are not supported */
     setst(pkt, ST_ERR | ST_DONE | E_BADCMD);
     return 0;
 }

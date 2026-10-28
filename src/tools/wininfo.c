@@ -361,7 +361,7 @@ int main(int argc, char **argv)
     struct sbuf s;
     int i;
     unsigned seg;
-    printf("WININFO 1.0 - WINDRV status\n");
+    printf("WININFO 1.1 - WINDRV status\n");
     if (_dos_allocmem(BIGSZ / 16, &seg)) {
         printf("not enough memory\n");
         return 1;

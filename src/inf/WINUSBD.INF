@@ -1,4 +1,4 @@
-; WINUSBD.INF - WINDRV 1.0 WINUSB for Windows 95, 98 and ME: Disk drives
+; WINUSBD.INF - WINDRV 1.1 WINUSB for Windows 95, 98 and ME: Disk drives
 ; USB mass storage devices: the I/O Supervisor loads the WINUSB.PDR port driver for them,
 ; which gives every partition a 32-bit drive letter.
 
@@ -28,7 +28,7 @@ HKR,,PortDriver,,WINUSB.PDR
 
 [Strings]
 Provider="WINDRV"
-DiskName="WINDRV WINUSB 1.0 disk"
+DiskName="WINDRV WINUSB 1.1 disk"
 UAS.Desc="WINUSB USB Attached SCSI (UAS) Disk"
 BOT.Desc="WINUSB USB Mass Storage Disk (Bulk-Only Transport)"
 Disk.Desc="WINUSB USB Mass Storage Disk"

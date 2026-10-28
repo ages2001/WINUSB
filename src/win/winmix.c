@@ -231,6 +231,24 @@ static void load_values(void)
     EnableWindow(hsrc, idx > 1);
 }
 
+/* the volumes of the device as WINSOUND.DRV keeps them (SYSTEM.INI [winsound.drv]): set again
+   when Windows starts */
+static void save(struct mdev *m)
+{
+    static const WORD ctls[NCTL + 2] = { 0, 1, 2, 3, 4, 5, MX_SRC, MX_MUTE };
+    char key[16], val[100], old[100];
+    DWORD v[NCTL + 2];
+    int i;
+    for (i = 0; i < NCTL + 2; i++) {
+        if (api(m->core, WINF_AUD_MIX, m->id, ctls[i], 0, 0, 0)) return;
+        v[i] = rq->retlen;
+    }
+    wsprintf(val, "%lX %lX %lX %lX %lX %lX %lX %lX", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+    wsprintf(key, "Volume%d.%d", m->core, m->id);
+    GetPrivateProfileString("winsound.drv", key, "", old, sizeof(old), "SYSTEM.INI");
+    if (lstrcmp(old, val)) WritePrivateProfileString("winsound.drv", key, val, "SYSTEM.INI");
+}
+
 static void set_value(int i, int pos)
 {
     struct mdev *m = &devs[cur];
@@ -246,6 +264,7 @@ static void set_value(int i, int pos)
     }
     vals[i] = l | (r << 16);
     api(m->core, WINF_AUD_MIX, m->id, (DWORD)i | 0x80000000L, vals[i], 0, 0);
+    save(m);
     wsprintf(t, "%d%%", (int)((DWORD)(RANGE - pos) * 100 / RANGE));
     SetWindowText(htxt[i], t);
 }
@@ -258,6 +277,7 @@ static void set_source(void)
         if (m->insrcs & (1 << s)) {
             if (idx++ == sel) {
                 api(m->core, WINF_AUD_MIX, m->id, MX_SRC | 0x80000000L, 1UL << s, 0, 0);
+                save(m);
                 break;
             }
         }

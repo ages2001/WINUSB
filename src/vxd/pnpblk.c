@@ -19,7 +19,12 @@ struct pdrinfo {
 
 u32 __cdecl svc_get_version(void)
 {
-    return PDR_VERSION | ((cb && (cb->opts & OPT_DEBUG)) ? 0x10000UL : 0);   /* bit 16: /D, PDR traces too */
+    /* bit 16: /D, PDR traces too; bit 17: the services of the USB WDM bridge (6-11) are there */
+#ifdef WIN_USB
+    return PDR_VERSION | ((cb && (cb->opts & OPT_DEBUG)) ? 0x10000UL : 0) | 0x20000UL;
+#else
+    return PDR_VERSION | ((cb && (cb->opts & OPT_DEBUG)) ? 0x10000UL : 0);
+#endif
 }
 
 static struct blkdev *blk_valid(u32 h)

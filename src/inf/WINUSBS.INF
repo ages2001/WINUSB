@@ -1,4 +1,4 @@
-; WINUSBS.INF - WINDRV 1.0 WINUSB for Windows 95, 98 and ME: System devices
+; WINUSBS.INF - WINDRV 1.1 WINUSB for Windows 95, 98 and ME: System devices
 ; Thunderbolt 3 / USB4 host interfaces (NHI: the USB, PCI Express and NVMe tunnels behind
 ; them) and Intel LPSS I2C controllers (HID over I2C touchpads and touch screens), driven by
 ; WINUSB.VXD.
@@ -61,6 +61,14 @@ WIN4G.VXD=1
 %NHI.Desc%=WINUSBS.Dev,PCI\VEN_8086&DEV_E333
 %NHI.Desc%=WINUSBS.Dev,PCI\VEN_8086&DEV_E423
 %NHI.Desc%=WINUSBS.Dev,PCI\VEN_8086&DEV_E433
+%NHI.Desc%=WINUSBS.Dev,PCI\VEN_8086&DEV_157D
+%NHI.Desc%=WINUSBS.Dev,PCI\VEN_8086&DEV_A833
+%NHI.Desc%=WINUSBS.Dev,PCI\VEN_8086&DEV_A834
+%NHI.Desc%=WINUSBS.Dev,PCI\VEN_8086&DEV_E334
+%NHI.Desc%=WINUSBS.Dev,PCI\VEN_8086&DEV_E434
+%NHI.Desc%=WINUSBS.Dev,PCI\VEN_8086&DEV_4D33
+%NHI.Desc%=WINUSBS.Dev,PCI\VEN_8086&DEV_5781
+%NHI.Desc%=WINUSBS.Dev,PCI\VEN_8086&DEV_5784
 
 [WINUSBS.Dev]
 CopyFiles=WINUSBS.Copy
@@ -80,6 +88,6 @@ system.ini,386Enh,,"device=win4g.vxd"
 
 [Strings]
 Provider="WINDRV"
-DiskName="WINDRV WINUSB 1.0 disk"
+DiskName="WINDRV WINUSB 1.1 disk"
 I2C.Desc="WINUSB Intel LPSS I2C Controller (HID over I2C)"
 NHI.Desc="WINUSB Thunderbolt 3 / USB4 Host Interface (NHI)"

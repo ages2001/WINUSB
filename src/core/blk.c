@@ -126,10 +126,15 @@ static u64 unit_lba(const struct winunit *u)
 }
 
 /* ---- BPB handling ---- */
+static int fat32_dos(void);
+static int fat32_bs(const u8 *bs);
+
 static int bpb_valid(const u8 *bs)
 {
     u16 bps = bs[11] | (bs[12] << 8);
     u8 spc = bs[13];
+    if (fat32_dos() && fat32_bs(bs) && ((bs[510] == 0x55 && bs[511] == 0xAA) || bs[0] == 0xEB || bs[0] == 0xE9))
+        return 1;
     if (bs[510] != 0x55 || bs[511] != 0xAA) {
         /* some formatters omit the signature, accept a sane BPB anyway */
         if (bs[0] != 0xEB && bs[0] != 0xE9) return 0;
@@ -142,9 +147,40 @@ static int bpb_valid(const u8 *bs)
     return 1;
 }
 
+/* the full BPB of a unit (the one DOS gets): FAT32 needs 53 bytes */
+static u8 *ubpbx(struct winunit *u)
+{
+    return (u8 *)cb + WIN_BPBXOFF + (u32)(u - cb->units) * WIN_BPBXSIZE;
+}
+
+/* FAT32 drives: MS-DOS 7.10 and later (FreeDOS with FAT32 reports 7.10 too) */
+static int fat32_dos(void)
+{
+    return cb->dosver >= 0x070A && plat_mode == PM_DOS;
+}
+
+static int fat32_bs(const u8 *bs)
+{
+    return !(bs[22] | bs[23]) && !(bs[17] | bs[18]) && (bs[36] | bs[37] | bs[38] | bs[39]) &&
+           bs[11] == 0 && bs[12] == 2 && bs[13] && !(bs[13] & (bs[13] - 1)) && (bs[16] == 1 || bs[16] == 2);
+}
+
 static void unit_fill_bpb(struct winunit *u, const u8 *bs)
 {
     memcpy(u->bpb, bs + 11, 25);
+    memset(ubpbx(u), 0, WIN_BPBXSIZE);
+    memcpy(ubpbx(u), bs + 11, fat32_bs(bs) ? 53 : 25);
+    if (fat32_bs(bs)) {
+        u->media = bs[21];
+        if (bs[66] == 0x29) {
+            u->serial = bs[67] | ((u32)bs[68] << 8) | ((u32)bs[69] << 16) | ((u32)bs[70] << 24);
+            memcpy(u->label, bs + 71, 11);
+        } else {
+            u->serial = 0;
+            memcpy(u->label, "NO NAME    ", 11);
+        }
+        return;
+    }
     u->media = bs[21];
     if (bs[38] == 0x29) {
         u->serial = bs[39] | ((u32)bs[40] << 8) | ((u32)bs[41] << 16) | ((u32)bs[42] << 24);
@@ -161,11 +197,47 @@ static const u8 default_bpb[25] = {
     0x3F, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00
 };
 
-static int fat32_too;            /* scan_parts: FAT32 partitions too (BIOS drive matching) */
+int blk_dosunits = 1;            /* 0: Windows 95/98/ME Plug and Play, the I/O Supervisor gives the letters */
+static int fat32_too;            /* blk_has_bpb: every volume (BIOS drive matching) */
+
+/* file systems of the volumes (pent.fs) */
+#define FS_NONE     0
+#define FS_FAT      1           /* FAT12/16, FAT32 from MS-DOS 7.10: DOS mounts it */
+#define FS_FAT32    2           /* FAT32 on an older DOS */
+#define FS_NTFS     3
+#define FS_EXFAT    4
+#define FS_HPFS     5
+#define FS_EXT      6
+#define FS_HFS      7
+static const char *const fsname[] = { "", "", "FAT32", "NTFS", "EXFAT", "HPFS", "LINUX", "HFS+" };
+
+/* partition table entries that are not volumes */
+static int is_ext_type(u8 t)
+{
+    return t == 0x05 || t == 0x0F || t == 0x85;
+}
 
 static int is_fat_type(u8 t)
 {
-    return t == 0x01 || t == 0x04 || t == 0x06 || t == 0x0E || (fat32_too && (t == 0x0B || t == 0x0C));
+    return t == 0x01 || t == 0x04 || t == 0x06 || t == 0x0E || t == 0x0B || t == 0x0C;
+}
+
+/* the file system of the volume at 512-byte sector start; reads secbuf */
+static int classify(struct blkdev *d, u64 start)
+{
+    if (blk_read_abs(d, start, 1, secbuf)) return FS_NONE;
+    if (!memcmp(secbuf + 3, "NTFS    ", 8)) return FS_NTFS;
+    if (!memcmp(secbuf + 3, "EXFAT   ", 8)) return FS_EXFAT;
+    if (fat32_bs(secbuf) && ((secbuf[510] == 0x55 && secbuf[511] == 0xAA) || secbuf[0] == 0xEB || secbuf[0] == 0xE9))
+        return fat32_dos() ? FS_FAT : FS_FAT32;
+    if (bpb_valid(secbuf)) return FS_FAT;
+    /* ext2/3/4 and HFS+ superblock at byte 1024, HPFS super block at sector 16 */
+    if (!blk_read_abs(d, start + 2, 1, secbuf)) {
+        if (secbuf[56] == 0x53 && secbuf[57] == 0xEF) return FS_EXT;
+        if (secbuf[0] == 'H' && (secbuf[1] == '+' || secbuf[1] == 'X')) return FS_HFS;
+    }
+    if (!blk_read_abs(d, start + 16, 1, secbuf) && *(u32 *)secbuf == 0xF995E849UL) return FS_HPFS;
+    return FS_NONE;
 }
 
 static int disk_index(struct blkdev *d)
@@ -180,21 +252,24 @@ static int bios_mounted(struct blkdev *d, u64 start)
 {
     int i;
     if (!d->shared) return 0;
+    if (cb->nmounted == 0xFF) return 1;     /* FreeDOS: its own drives, list unknown */
     for (i = 0; i < cb->nmounted && i < 16; i++) {
         if (cb->mounted[i].biosdrv - 0x80 == (int)d->shared - 1 && cb->mounted[i].start == start) return 1;
     }
     return 0;
 }
 
-struct pent { u8 type; u64 start; u32 size; };   /* 512-byte sectors (after scan_parts) */
+struct pent { u8 type; u8 fs; u64 start; u32 size; };   /* 512-byte sectors (after scan_parts) */
 
-/* collect FAT partitions of a disk: primaries first, then logical drives */
+/* collect the volumes of a disk: primaries first, then logical drives */
 static int scan_parts_raw(struct blkdev *d, struct pent *pe, int max);
 
-/* partition tables are written in device sectors: convert to 512-byte units */
-static int scan_parts(struct blkdev *d, struct pent *pe, int max)
+/* partition tables are written in device sectors: convert to 512-byte units, then find the
+   file system of every partition. foreign: file systems DOS cannot mount stay in the list
+   (they get a drive letter of their own on removable disks) */
+static int scan_parts(struct blkdev *d, struct pent *pe, int max, int foreign)
 {
-    int n = scan_parts_raw(d, pe, max), i;
+    int n = scan_parts_raw(d, pe, max), i, k;
     u32 f = d->ssize / 512;
     if (n > 0 && f > 1) {
         for (i = 0; i < n; i++) {
@@ -204,7 +279,12 @@ static int scan_parts(struct blkdev *d, struct pent *pe, int max)
             pe[i].size = (u64)pe[i].size * f > 0xFFFFFFFFUL ? 0xFFFFFFFFUL : pe[i].size * f;
         }
     }
-    return n;
+    for (i = k = 0; i < n; i++) {
+        pe[i].fs = (u8)classify(d, pe[i].start);
+        if (pe[i].fs == FS_NONE || (pe[i].fs != FS_FAT && !foreign && !fat32_too)) continue;
+        pe[k++] = pe[i];
+    }
+    return n < 0 ? n : k;
 }
 
 static int scan_parts_raw(struct blkdev *d, struct pent *pe, int max)
@@ -214,19 +294,20 @@ static int scan_parts_raw(struct blkdev *d, struct pent *pe, int max)
     static u8 mbr[512];
     if (blk_read_abs(d, 0, 1, secbuf)) return -1;
     memcpy(mbr, secbuf, 512);
-    if (mbr[510] != 0x55 || mbr[511] != 0xAA) return 0;
-    /* superfloppy: FAT boot sector at LBA 0 */
-    if (bpb_valid(mbr) && (mbr[0] == 0xEB || mbr[0] == 0xE9)) {
+    /* superfloppy: a volume boot sector at LBA 0 (FAT, NTFS, exFAT) */
+    if (!memcmp(mbr + 3, "NTFS    ", 8) || !memcmp(mbr + 3, "EXFAT   ", 8) ||
+        ((bpb_valid(mbr) || fat32_bs(mbr)) && (mbr[0] == 0xEB || mbr[0] == 0xE9))) {
         u8 t = mbr[0x1C2];
         u32 s = mbr[0x1C6] | ((u32)mbr[0x1C7] << 8) | ((u32)mbr[0x1C8] << 16) | ((u32)mbr[0x1C9] << 24);
-        if (!(is_fat_type(t) && s && s < total)) {
+        if (!(mbr[510] == 0x55 && mbr[511] == 0xAA && is_fat_type(t) && s && s < total)) {
             pe[0].type = 0x06; pe[0].start = 0; pe[0].size = total;
             return 1;
         }
     }
+    if (mbr[510] != 0x55 || mbr[511] != 0xAA) return 0;
     if (mbr[0x1C2] == 0xEE) {
-        /* GPT protective MBR: basic data partitions holding FAT12/16, anywhere on the disk
-           (beyond 2 TB too); LBAs are in device sectors */
+        /* GPT protective MBR: every partition entry, anywhere on the disk (beyond 2 TB too);
+           LBAs are in device sectors */
         u64 entlba, sec;
         u32 nent, esz, k;
         if (blk_read_abs(d, d->ssize / 512, 1, secbuf)) return n;
@@ -242,11 +323,10 @@ static int scan_parts_raw(struct blkdev *d, struct pent *pe, int max)
             sec = entlba * (d->ssize / 512) + (k * esz) / 512;
             if (off == 0 && blk_read_abs(d, sec, 1, secbuf)) break;
             e = secbuf + off;
-            /* EBD0A0A2-B9E5-4433-87C0-68B6B72699C7 */
-            if (*(u32 *)e != 0xEBD0A0A2UL) continue;
+            if (!(*(u32 *)e | *(u32 *)(e + 4) | *(u32 *)(e + 8) | *(u32 *)(e + 12))) continue;   /* unused */
             first = *(u32 *)(e + 32) | ((u64)*(u32 *)(e + 36) << 32);
             last = *(u32 *)(e + 40) | ((u64)*(u32 *)(e + 44) << 32);
-            if (last < first || last - first >= 0xFFFFFFFFUL) continue;     /* not a FAT size */
+            if (last < first || last - first >= 0xFFFFFFFFUL) continue;     /* too big for a letter */
             if ((first >> 32) >= 256 / (d->ssize / 512)) continue;          /* beyond 512 TB */
             pe[n].type = 0x0E; pe[n].start = first; pe[n].size = (u32)(last - first + 1);
             n++;
@@ -257,13 +337,11 @@ static int scan_parts_raw(struct blkdev *d, struct pent *pe, int max)
         u8 *e = mbr + 446 + i * 16;
         u32 s = *(u32 *)(e + 8), sz = *(u32 *)(e + 12);
         if (!e[4] || !sz) continue;
-        if (e[4] == 0x05 || e[4] == 0x0F || e[4] == 0x85) {
+        if (is_ext_type(e[4])) {
             if (!ext) ext = s;
             continue;
         }
-        if (is_fat_type(e[4])) {
-            pe[n].type = e[4]; pe[n].start = s; pe[n].size = sz; n++;
-        }
+        pe[n].type = e[4]; pe[n].start = s; pe[n].size = sz; n++;
     }
     if (ext) {
         u32 cur = ext;
@@ -273,13 +351,13 @@ static int scan_parts_raw(struct blkdev *d, struct pent *pe, int max)
             if (secbuf[510] != 0x55 || secbuf[511] != 0xAA) break;
             e1 = secbuf + 446;
             e2 = secbuf + 462;
-            if (is_fat_type(e1[4]) && *(u32 *)(e1 + 12)) {
+            if (e1[4] && !is_ext_type(e1[4]) && *(u32 *)(e1 + 12)) {
                 pe[n].type = e1[4];
                 pe[n].start = cur + *(u32 *)(e1 + 8);
                 pe[n].size = *(u32 *)(e1 + 12);
                 n++;
             }
-            if (e2[4] == 0x05 || e2[4] == 0x0F || e2[4] == 0x85) {
+            if (is_ext_type(e2[4])) {
                 u32 nx = ext + *(u32 *)(e2 + 8);
                 if (nx == cur || !*(u32 *)(e2 + 8)) break;
                 cur = nx;
@@ -294,33 +372,104 @@ static int scan_parts_raw(struct blkdev *d, struct pent *pe, int max)
 /* 1 if a FAT volume of d (FAT32 included) has the boot sector BPB of a DOS drive: bpb is the
    25-byte BPB of the DOS block device (bytes per sector .. total sectors), compared without
    the geometry and hidden sectors fields, which DOS may have adjusted */
+/* a DOS drive (its BPB from IO.SYS) is on disk d: a partition with the same boot sector
+   BPB, or a partition without a FAT boot sector (a drive DOS calls unformatted: UDF, a new
+   partition) at the place or of the size the BPB names */
 int blk_has_bpb(struct blkdev *d, const u8 *bpb)
 {
     struct pent pe[24];
     int n, i;
+    u32 hidden = bpb[17] | ((u32)bpb[18] << 8) | ((u32)bpb[19] << 16) | ((u32)bpb[20] << 24);
+    u32 total = bpb[8] | ((u32)bpb[9] << 8);
+    if (!total) total = bpb[21] | ((u32)bpb[22] << 8) | ((u32)bpb[23] << 16) | ((u32)bpb[24] << 24);
     fat32_too = 1;
-    n = scan_parts(d, pe, 24);
+    n = scan_parts(d, pe, 24, 1);
     fat32_too = 0;
     for (i = 0; i < n; i++) {
+        u32 btot;
         if (blk_read_abs(d, pe[i].start, 1, secbuf)) continue;
-        if (secbuf[510] != 0x55 || secbuf[511] != 0xAA) continue;
-        if (!memcmp(secbuf + 0x0B, bpb, 13) && !memcmp(secbuf + 0x20, bpb + 21, 4)) return 1;
+        btot = secbuf[0x13] | ((u32)secbuf[0x14] << 8);
+        if (!btot) btot = *(u32 *)(secbuf + 0x20);
+        /* the same BPB (DOS may keep the total sectors in the other field) */
+        if (secbuf[510] == 0x55 && secbuf[511] == 0xAA && !memcmp(secbuf + 0x0B, bpb, 8) &&
+            !memcmp(secbuf + 0x15, bpb + 10, 3) && btot == total)
+            return 1;
+        if (!bpb_valid(secbuf) && !(secbuf[0x26] == 0x29 && secbuf[0x52] == 'F') &&
+            (hidden == (u32)pe[i].start || (total && total == pe[i].size)))
+            return 1;
     }
     return 0;
+}
+
+/* a volume DOS cannot mount (NTFS, exFAT, FAT32 before MS-DOS 7.10, ...) still gets its
+   drive letter: DOS sees a tiny write-protected FAT12 volume labelled with the name of the
+   file system, with nothing on it */
+#define SYN_SECTORS 8
+static void syn_mount(struct winunit *u, int fs)
+{
+    u8 *b = u->bpb;
+    const char *nm = fsname[fs];
+    int i;
+    memset(b, 0, 25);
+    b[1] = 2;                           /* 512 bytes per sector */
+    b[2] = 1;                           /* 1 sector per cluster */
+    b[3] = 1;                           /* 1 reserved sector */
+    b[5] = 1;                           /* 1 FAT */
+    b[6] = 16;                          /* 16 root directory entries */
+    b[8] = SYN_SECTORS;
+    b[10] = 0xF8;
+    b[11] = 1;                          /* sectors per FAT */
+    b[13] = 63;
+    b[15] = 255;
+    *(u32 *)(b + 17) = u->lba;
+    memset(ubpbx(u), 0, WIN_BPBXSIZE);
+    memcpy(ubpbx(u), b, 25);
+    u->media = 0xF8;
+    u->serial = u->lba ^ u->key;
+    for (i = 0; i < 11; i++) u->label[i] = *nm ? *nm++ : ' ';
+    u->state |= US_FOREIGN;
+}
+
+/* sector n of the volume of syn_mount */
+static void syn_sector(struct winunit *u, u32 n, u8 *p)
+{
+    memset(p, 0, 512);
+    if (n == 0) {
+        p[0] = 0xEB; p[1] = 0x3C; p[2] = 0x90;
+        memcpy(p + 3, "WINDRV  ", 8);
+        memcpy(p + 11, u->bpb, 25);
+        p[38] = 0x29;
+        *(u32 *)(p + 39) = u->serial;
+        memcpy(p + 43, u->label, 11);
+        memcpy(p + 54, "FAT12   ", 8);
+        p[510] = 0x55; p[511] = 0xAA;
+    } else if (n == 1) {
+        p[0] = 0xF8; p[1] = 0xFF; p[2] = 0xFF;
+    } else if (n == 2) {
+        memcpy(p, u->label, 11);        /* the volume label entry */
+        p[11] = 0x08;
+    }
 }
 
 /* read the boot sector of a unit and update its BPB/state */
 static int unit_mount(struct winunit *u, struct blkdev *d)
 {
-    if (blk_read_abs(d, unit_lba(u), 1, secbuf)) return -1;
-    if (!bpb_valid(secbuf)) {
-        memcpy(u->bpb, default_bpb, 25);
-        u->media = 0xF8;
-        memcpy(u->label, "NO NAME    ", 11);
-        return 1;
+    int fs = classify(d, unit_lba(u));
+    u->state &= ~US_FOREIGN;
+    if (fs == FS_FAT && !blk_read_abs(d, unit_lba(u), 1, secbuf)) {
+        unit_fill_bpb(u, secbuf);
+        return 0;
     }
-    unit_fill_bpb(u, secbuf);
-    return 0;
+    if (fs != FS_NONE && fs != FS_FAT && u->type == UT_SLOT) {
+        syn_mount(u, fs);
+        return 0;
+    }
+    memcpy(u->bpb, default_bpb, 25);
+    memset(ubpbx(u), 0, WIN_BPBXSIZE);
+    memcpy(ubpbx(u), default_bpb, 25);
+    u->media = 0xF8;
+    memcpy(u->label, "NO NAME    ", 11);
+    return 1;
 }
 
 static u32 disk_key2(struct blkdev *d)
@@ -351,6 +500,8 @@ static int add_unit(int type, struct blkdev *d, struct pent *p, int partno)
         unit_mount(u, d);
     } else {
         memcpy(u->bpb, default_bpb, 25);
+        memset(ubpbx(u), 0, WIN_BPBXSIZE);
+        memcpy(ubpbx(u), default_bpb, 25);
         u->media = 0xF8;
     }
     return cb->nunits++;
@@ -378,7 +529,7 @@ void blk_scan_fixed(void)
             why[i] = 1;
             continue;
         }
-        n = scan_parts(d, pe, 16);
+        n = scan_parts(d, pe, 16, 0);
         why[i] = n <= 0 ? 2 : 3;
         kprintf("disk%d: %s, %d FAT partition(s)%s\n", i, d->model, n < 0 ? 0 : n,
                 d->shared ? " (BIOS disk)" : "");
@@ -399,7 +550,7 @@ void blk_scan_fixed(void)
         int need = 0;
         for (i = 0; i < ndisks; i++) {
             if (!disks[i]->removable || disks[i]->cdrom || !disks[i]->present) continue;
-            n = scan_parts(disks[i], pe, 16);
+            n = scan_parts(disks[i], pe, 16, 1);
             if (n > 0) need += n;
         }
         if (need && need + 1 > nslots) nslots = need + 1;
@@ -421,7 +572,7 @@ void blk_explain(int nide, int nahci, int nnvme)
     static const char *const kind[] = { "?", "AHCI", "NVMe", "USB", "IDE", "SD", "MMC" };
     static const char *const text[] = {
         "", "on an IDE channel the BIOS uses (DOS drives, boot disk)",
-        "no FAT12/FAT16 partition (DOS cannot use FAT32, NTFS, ...)",
+        "no FAT partition this DOS can use (FAT32: MS-DOS 7.10 and later)",
         "its FAT partitions are already DOS drives through the BIOS"
     };
     int i;
@@ -449,6 +600,7 @@ static void match_bios(struct blkdev *d)
     u32 c;
     if (d->shared || !cb->nbios || blk_read_abs(d, 0, 1, bounce)) return;
     c = crc32(0, bounce, 512);
+    DBG("disk%d: first sector %08lx, BIOS disks %08lx %08lx\n", disk_index(d), c, cb->biosmbr[0], cb->biosmbr[1]);
     for (k = 0; k < cb->nbios && k < 8; k++)
         if (cb->biosmbr[k] == c) {
             d->shared = (u8)(k + 1);
@@ -459,13 +611,13 @@ static void match_bios(struct blkdev *d)
 
 static int slot_attach(struct blkdev *d)
 {
-    struct pent pe[8];
+    struct pent pe[16];
     int n, j, i, used = 0;
-    if (!cb->nunits) return 0;          /* no DOS drive letters at all (Plug and Play: IOS owns the disks) */
+    if (!cb->nunits || !blk_dosunits) return 0;     /* no DOS drive letters (Plug and Play: IOS owns the disks) */
     match_bios(d);
-    n = scan_parts(d, pe, 8);
+    n = scan_parts(d, pe, 16, 1);
     if (n <= 0) {
-        kprintf("disk%d: no FAT partition\n", disk_index(d));
+        kprintf("disk%d: no volume DOS can use\n", disk_index(d));
         return 0;
     }
     for (j = 0; j < n; j++) {
@@ -477,13 +629,13 @@ static int slot_attach(struct blkdev *d)
         /* sticky: same device and partition gets its old slot back, else the first free slot */
         for (i = 0; i < cb->nunits; i++) {
             struct winunit *u = &cb->units[i];
-            if (u->type == UT_SLOT && !(u->state & US_PRESENT) && u->key == d->key &&
+            if (u->type == UT_SLOT && !(u->state & (US_PRESENT | US_TAKEN)) && u->key == d->key &&
                 u->key2 == d->key2 && u->part == j && u->key) { pick = i; break; }
         }
         if (pick < 0) {
             for (i = 0; i < cb->nunits; i++) {
                 struct winunit *u = &cb->units[i];
-                if (u->type == UT_SLOT && !(u->state & US_PRESENT)) { pick = i; break; }
+                if (u->type == UT_SLOT && !(u->state & (US_PRESENT | US_TAKEN))) { pick = i; break; }
             }
         }
         if (pick < 0) {
@@ -504,7 +656,8 @@ static int slot_attach(struct blkdev *d)
             if (d->wprot) u->state |= US_WPROT;
             u->gen++;
             unit_mount(u, d);
-            kprintf("disk%d part %d -> %c:\n", disk_index(d), j, 'A' + cb->firstdrive + pick);
+            kprintf("disk%d part %d -> %c:%s%s\n", disk_index(d), j, 'A' + cb->firstdrive + pick,
+                    pe[j].fs == FS_FAT ? "" : " ", fsname[pe[j].fs]);
             plat_unit_changed(pick);
             used++;
         }
@@ -664,6 +817,17 @@ static int dos_rw(u8 *pkt, struct winunit *u, int wr)
         setst(pkt, ST_ERR | ST_DONE | E_BADCHG);
         return 0;
     }
+    if (u->state & US_FOREIGN) {
+        u32 k;
+        if (wr || start + cnt > SYN_SECTORS) {
+            *(u16 *)(pkt + 0x12) = 0;
+            setst(pkt, ST_ERR | ST_DONE | (wr ? E_WP : E_NOTFOUND));
+            return 0;
+        }
+        for (k = 0; k < cnt; k++) syn_sector(u, start + k, buf + k * 512);
+        setst(pkt, ST_DONE);
+        return 0;
+    }
     if (start + cnt > u->sectors) {
         *(u16 *)(pkt + 0x12) = 0;
         setst(pkt, ST_ERR | ST_DONE | E_NOTFOUND);
@@ -712,8 +876,12 @@ static int dos_ioctl(u8 *pkt, struct winunit *u)
         *(u16 *)(p + 2) = (u->type == UT_FIXED) ? 1 : 2;   /* nonremovable / changeline */
         *(u16 *)(p + 4) = cyl;
         p[6] = 0;
-        memcpy(p + 7, u->bpb, 25);
-        memset(p + 7 + 25, 0, 6);
+        if (cat == 0x48) {
+            memcpy(p + 7, ubpbx(u), 53);    /* FAT32 BPB (MS-DOS 7.10) */
+        } else {
+            memcpy(p + 7, u->bpb, 25);
+            memset(p + 7 + 25, 0, 6);
+        }
         setst(pkt, ST_DONE);
         return 0;
     case 0x40:  /* set device parameters */
@@ -736,12 +904,11 @@ static int dos_ioctl(u8 *pkt, struct winunit *u)
         *(u16 *)p = 0;
         *(u32 *)(p + 2) = u->serial;
         memcpy(p + 6, u->label, 11);
-        memcpy(p + 17, u->bpb[23] || u->bpb[24] ? "FAT16   " : "FAT12   ", 8);
         {
             u32 tot = u->bpb[8] | (u->bpb[9] << 8);
             u32 spc = u->bpb[2] ? u->bpb[2] : 1;
             if (!tot) tot = *(u32 *)(u->bpb + 21);
-            memcpy(p + 17, (tot / spc) < 4085 ? "FAT12   " : "FAT16   ", 8);
+            memcpy(p + 17, !(u->bpb[11] | u->bpb[12]) ? "FAT32   " : (tot / spc) < 4085 ? "FAT12   " : "FAT16   ", 8);
         }
         setst(pkt, ST_DONE);
         return 0;
@@ -756,6 +923,10 @@ static int dos_ioctl(u8 *pkt, struct winunit *u)
         int r;
         if (!d || !(u->state & US_PRESENT)) {
             setst(pkt, ST_ERR | ST_DONE | E_NOTREADY);
+            return 0;
+        }
+        if (u->state & US_FOREIGN) {
+            setst(pkt, ST_ERR | ST_DONE | (fn == 0x41 ? E_WP : E_NOTFOUND));
             return 0;
         }
         abs = abs >= hidden ? abs - hidden : abs;
@@ -810,7 +981,7 @@ int blk_dos_request(u8 *pkt)
             if (d) unit_mount(u, d);
             u->state &= ~US_CHANGED;
         }
-        *(u32 *)(pkt + 0x12) = cb_farptr(u->bpb);
+        *(u32 *)(pkt + 0x12) = cb_farptr(ubpbx(u));
         setst(pkt, ST_DONE);
         return 0;
     case 0x04:
