@@ -27,6 +27,12 @@
 
 #define DCB_TYPEMASK        0x0007
 
+/* Windows 95/98/ME: messages of a driver loaded for a devnode (MMDEVLDR.VXD) */
+#define DRVM_INIT           0x0064
+#define DRVM_EXIT           0x0065
+#define DRVM_DISABLE        0x0066
+#define DRVM_ENABLE         0x0067
+
 #define WODM_GETNUMDEVS     3
 #define WODM_GETDEVCAPS     4
 #define WODM_OPEN           5
@@ -112,7 +118,9 @@ UINT WINAPI GlobalDosFree(UINT sel);
 #define MIDICHUNK   1024
 
 struct sdev {
-    BYTE core, id, type, caps, insrcs, gone, ctl, rsv;
+    BYTE core, id, type, caps, insrcs, gone, ctl;
+    BYTE pnp;                   /* on a devnode MMDEVLDR.VXD loads (dn): only that driver instance has it */
+    DWORD dn;
     DWORD rate;
     char name[32];
 };
@@ -129,7 +137,7 @@ static struct sdev wouts[MAXDEV], wins[MAXDEV], mouts[MAXDEV], auxs[MAXDEV], mix
 static int nwout, nwin, nmout, naux, nmix;
 
 /* ---- open streams ---- */
-#define WQLEN       32
+#define WQLEN       64          /* DirectSound (emulated) and players queue many small buffers */
 #define QAT(w, i)   ((w)->q[((w)->qh + (i)) % WQLEN])
 struct wstream {
     BYTE used, dir, core, dev, started, paused, gone, loopon;
@@ -254,6 +262,8 @@ static int api(int k, WORD fn, DWORD a0, DWORD a1, DWORD a2, DWORD buf, DWORD le
 
 #define RQBUF(off) (((DWORD)reqseg << 16) | (off))
 
+static int win9x(void);
+
 static void add_dev(struct sdev *tab, int *n, int core, struct winauddev FAR *d, const char *suffix)
 {
     struct sdev *s;
@@ -269,6 +279,12 @@ static void add_dev(struct sdev *tab, int *n, int core, struct winauddev FAR *d,
     s->rate = d->rate;
     s->gone = d->gone;
     s->ctl = 0;
+    s->pnp = 0;
+    s->dn = 0;
+    if (win9x() && api(core, WINF_AUD_DSNODE, d->id, 0, 0, 0, 0) == WINE_OK) {
+        s->dn = rq->retlen;
+        s->pnp = (BYTE)(rq->arg1 != 0);
+    }
     s->name[0] = 'W';
     s->name[1] = 'I';
     s->name[2] = 'N';
@@ -301,9 +317,31 @@ static struct sdev *find_dev(struct sdev *tab, int n, int k, int id, int ctl)
 
 /* MMSYSTEM counts the devices of a driver only when it loads the driver. USB audio devices
    plugged in later take one of these reserved entries of the USB core; an entry that is
-   not connected fails to open, so WAVE_MAPPER and sndPlaySound move on to the next device. */
+   not connected fails to open, so WAVE_MAPPER and sndPlaySound move on to the next device.
+   Windows 95/98/ME with WINUSB.VXD: every USB audio device has a devnode of its own
+   (WINUSBA.INF, DevLoader MMDEVLDR.VXD) and MMSYSTEM loads the driver for it when it is
+   plugged in: its devices are new entries of that instance, no entries are reserved
+   (usbpnp; the GM synthesizer of the USB core stays one entry of the SYSTEM.INI instance). */
 #define USBSLOTS    2
 #define NOID        0xFF
+
+static BYTE usbpnp;
+
+/* the devnode of USB device d when MMDEVLDR.VXD loaded the driver for it, else 0 */
+static DWORD usb_dn(int k, struct winauddev FAR *d)
+{
+    if (k != 1 || !usbpnp || d->gone) return 0;
+    if (api(1, WINF_AUD_DSNODE, d->id, 0, 0, 0, 0) != WINE_OK || !rq->arg1) return 0;
+    return rq->retlen;
+}
+
+/* an entry of a devnode instance follows its device to the devnode it has now (plugged in
+   again: MMSYSTEM loads the driver for the new devnode) */
+static void follow_dn(struct sdev *e, int k, struct winauddev FAR *d)
+{
+    DWORD dn;
+    if (e->pnp && (dn = usb_dn(k, d)) != 0) e->dn = dn;
+}
 
 static void placeholder(struct sdev *tab, int *n, const char *name, int num, int ctl)
 {
@@ -325,33 +363,43 @@ static void reserve_usb(void)
 {
     int i, have;
     if (!present[1]) return;
+    if (usbpnp) goto synth;
     for (i = have = 0; i < nwout; i++) have += wouts[i].core == 1;
     for (i = have; i < USBSLOTS; i++) placeholder(wouts, &nwout, "WIN USB Audio", i + 1, 0);
     for (i = have = 0; i < nwin; i++) have += wins[i].core == 1;
     for (i = have; i < USBSLOTS; i++) placeholder(wins, &nwin, "WIN USB Audio In", i + 1, 0);
     for (i = have = 0; i < nmout; i++) have += mouts[i].core == 1 && mouts[i].ctl == 0;
     for (i = have; i < USBSLOTS; i++) placeholder(mouts, &nmout, "WIN USB MIDI", i + 1, 0);
+synth:
     for (i = have = 0; i < nmout; i++) have += mouts[i].core == 1 && mouts[i].ctl == 1;
     if (!have) placeholder(mouts, &nmout, "WIN USB GM Synth", 0, 1);
 }
 
-/* entry for core device d: the known one, else a new one (while the driver loads), else
-   a free reserved entry of the core */
+/* entry for core device d: the known one, else a new one (while the driver loads, or of
+   the instance of its own devnode), else a free reserved entry of the core */
 static struct sdev *bind_dev(struct sdev *tab, int *n, int k, struct winauddev FAR *d, const char *suffix,
                              int loading)
 {
     struct sdev *e = find_dev(tab, *n, k, d->id, 0);
     int i;
-    if (e) return e;
+    if (e) {
+        follow_dn(e, k, d);
+        return e;
+    }
     if (loading) {
         add_dev(tab, n, k, d, suffix);
         return NULL;
     }
+    if (usb_dn(k, d)) {
+        if (*n >= MAXDEV) return NULL;
+        add_dev(tab, n, k, d, suffix);
+        return &tab[*n - 1];
+    }
     for (i = 0; i < *n; i++)
-        if (tab[i].core == k && tab[i].ctl == 0 && tab[i].id == NOID) break;
+        if (tab[i].core == k && tab[i].ctl == 0 && !tab[i].pnp && tab[i].id == NOID) break;
     if (i == *n)
         for (i = 0; i < *n; i++)
-            if (tab[i].core == k && tab[i].ctl == 0 && tab[i].gone) break;
+            if (tab[i].core == k && tab[i].ctl == 0 && !tab[i].pnp && tab[i].gone) break;
     if (i == *n) return NULL;
     tab[i].id = d->id;
     tab[i].type = d->type;
@@ -379,9 +427,14 @@ static void merge(int k, int loading)
         if ((d->caps & WINAC_IN) && (e = bind_dev(wins, &nwin, k, d, NULL, loading)) != NULL) e->gone = d->gone;
         if ((d->caps & WINAC_MIDI) && (e = bind_dev(mouts, &nmout, k, d, " MIDI", loading)) != NULL) e->gone = d->gone;
         if (d->caps & (WINAC_OUT | WINAC_IN)) {
-            /* a mixer for each device found while the driver loads */
-            if ((e = find_dev(mixs, nmix, k, d->id, 0)) != NULL) e->gone = d->gone;
-            else if (loading) add_dev(mixs, &nmix, k, d, NULL);
+            /* a mixer for each device found while the driver loads and for each device of a
+               devnode instance */
+            if ((e = find_dev(mixs, nmix, k, d->id, 0)) != NULL) {
+                e->gone = d->gone;
+                follow_dn(e, k, d);
+            } else if (loading || usb_dn(k, d)) {
+                add_dev(mixs, &nmix, k, d, NULL);
+            }
         }
         if ((d->caps & WINAC_SYNTH) && !d->gone && !synth) {
             /* the synthesizer plays on the first present device of the core */
@@ -391,6 +444,7 @@ static void merge(int k, int loading)
                 e = &mouts[nmout - 1];
                 set_name(e, k ? "WIN USB GM Synth" : "WIN GM Synth");
                 e->ctl = 1;
+                if (k) e->pnp = 0;  /* plays on whichever USB device is there */
             }
             if (e) {
                 e->id = d->id;
@@ -401,7 +455,7 @@ static void merge(int k, int loading)
             add_dev(auxs, &naux, k, d, NULL);
             set_name(&auxs[naux - 1], "WIN Master Volume");
             auxs[naux - 1].ctl = MX_MASTER;
-            if (d->type == 2) {     /* AC'97: analog CD and line inputs */
+            if (d->type == 2 || d->type == 4 || d->type == 5) {     /* AC'97, AudioPCI, EMU10K1: CD and line inputs */
                 add_dev(auxs, &naux, k, d, NULL);
                 set_name(&auxs[naux - 1], "WIN CD Audio");
                 auxs[naux - 1].ctl = MX_CD;
@@ -485,6 +539,7 @@ static void scan(void)
             }
         }
         if (!present[k]) continue;
+        if (k == 1 && win9x() && api(1, WINF_AUD_DSNODE, 0xFFFFFFFFUL, 0, 0, 0, 0) == WINE_OK) usbpnp = 1;
         merge(k, 1);
     }
     reserve_usb();
@@ -839,13 +894,93 @@ static DWORD vol_set(struct sdev *d, int ctl, DWORD v)
     return MMSYSERR_NOERROR;
 }
 
+/* ---------------------------------------------------------------- driver instances
+
+   Windows 95/98/ME: MMSYSTEM loads the driver once for SYSTEM.INI [drivers] and once for
+   every devnode that lists it in its software key (DevLoader MMDEVLDR.VXD, WINAUDM.INF); the
+   instance of a devnode has the devices on that devnode, the SYSTEM.INI one the others.
+   DirectSound finds the HAL of a wave device through that devnode (DRV_QUERYDEVNODE, which
+   MMSYSTEM answers). The messages name the devnode: DRVM_INIT and GETDEVCAPS dwParam2 (then
+   dwParam1 is an MDEVICECAPSEX), GETNUMDEVS dwParam1, the open descriptions dnDevNode, the
+   volumes dwParam2. Device numbers count within the instance. */
+
+typedef struct {
+    DWORD cbSize;
+    void FAR *pCaps;
+} MDEVICECAPSEX;
+
+static DWORD pnps[MAXDEV];
+static int npnp;
+
+static int pnp_is(DWORD dn)
+{
+    int i;
+    for (i = 0; dn && i < npnp; i++)
+        if (pnps[i] == dn) return 1;
+    return 0;
+}
+
+/* DRVM_*: 1 when msg is one of them */
+static int pnp_msg(UINT msg, DWORD dn)
+{
+    if (msg == DRVM_INIT && dn && !pnp_is(dn) && npnp < MAXDEV) pnps[npnp++] = dn;
+    return msg == DRVM_INIT || msg == DRVM_EXIT || msg == DRVM_ENABLE || msg == DRVM_DISABLE;
+}
+
+#define DNOF(p)     (pnp_is(p) ? (p) : 0)
+
+static int inst_has(const struct sdev *d, DWORD dn)
+{
+    return d->pnp ? d->dn == dn : !dn;
+}
+
+static int inst_num(const struct sdev *tab, int n, DWORD dn)
+{
+    int i, k = 0;
+    for (i = 0; i < n; i++) k += inst_has(&tab[i], dn);
+    return k;
+}
+
+/* device id of the instance -> index in tab, -1 none */
+static int inst_dev(const struct sdev *tab, int n, DWORD dn, UINT id)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        if (inst_has(&tab[i], dn) && !id--) return i;
+    return -1;
+}
+
+/* the devnode in an open description (Windows 95/98/ME layouts: dnDevNode at off) */
+static DWORD open_dn(DWORD p1, int off)
+{
+    if (!p1 || !win9x()) return 0;
+    return DNOF(*(DWORD FAR *)((BYTE FAR *)p1 + off));
+}
+
+/* GETDEVCAPS answer: into the MDEVICECAPSEX of an instance call, else dwParam1 / dwParam2 */
+static void caps_out(DWORD p1, DWORD p2, const void *c, WORD n)
+{
+    if (pnp_is(p2)) {
+        MDEVICECAPSEX FAR *x = (MDEVICECAPSEX FAR *)p1;
+        fmemcpy(x->pCaps, c, (WORD)MIN(x->cbSize, n));
+    } else {
+        fmemcpy((void FAR *)p1, c, (WORD)MIN(p2, n));
+    }
+}
+
 DWORD CALLBACK __loadds wodMessage(UINT id, UINT msg, DWORD user, DWORD p1, DWORD p2)
 {
     struct wstream *w;
+    int g;
     scan();
+    if (pnp_msg(msg, p2)) return MMSYSERR_NOERROR;
     if (msg == WODM_GETNUMDEVS || msg == WODM_OPEN || msg == WODM_GETDEVCAPS) rescan();
-    if (msg == WODM_GETNUMDEVS) return nwout;
-    if (id >= (UINT)nwout && msg != WODM_CLOSE) return MMSYSERR_BADDEVICEID;
+    if (msg == WODM_GETNUMDEVS) return inst_num(wouts, nwout, DNOF(p1));
+    if (msg == WODM_GETDEVCAPS || msg == WODM_OPEN || msg == WODM_GETVOLUME || msg == WODM_SETVOLUME) {
+        g = inst_dev(wouts, nwout, msg == WODM_OPEN ? open_dn(p1, 16) : DNOF(p2), id);
+        if (g < 0) return MMSYSERR_BADDEVICEID;
+        id = (UINT)g;
+    }
     switch (msg) {
     case WODM_GETDEVCAPS:
     {
@@ -853,12 +988,12 @@ DWORD CALLBACK __loadds wodMessage(UINT id, UINT msg, DWORD user, DWORD p1, DWOR
         fmemset(&c, 0, sizeof(c));
         c.wMid = 0x6033;
         c.wPid = (WORD)(0x10 + wouts[id].type);
-        c.vDriverVersion = 0x0110;
+        c.vDriverVersion = 0x0120;
         fstrncpy(c.szPname, wouts[id].name, MAXPNAMELEN);
         c.dwFormats = 0x0FFF;
         c.wChannels = 2;
-        c.dwSupport = WAVECAPS_VOLUME | WAVECAPS_LRVOLUME;
-        fmemcpy((void FAR *)p1, &c, (WORD)MIN(p2, sizeof(c)));
+        c.dwSupport = WAVECAPS_VOLUME | WAVECAPS_LRVOLUME | 0x0020;    /* WAVECAPS_SAMPLEACCURATE */
+        caps_out(p1, p2, &c, sizeof(c));
         return MMSYSERR_NOERROR;
     }
     case WODM_OPEN:
@@ -922,10 +1057,16 @@ DWORD CALLBACK __loadds wodMessage(UINT id, UINT msg, DWORD user, DWORD p1, DWOR
 DWORD CALLBACK __loadds widMessage(UINT id, UINT msg, DWORD user, DWORD p1, DWORD p2)
 {
     struct wstream *w;
+    int g;
     scan();
+    if (pnp_msg(msg, p2)) return MMSYSERR_NOERROR;
     if (msg == WIDM_GETNUMDEVS || msg == WIDM_OPEN || msg == WIDM_GETDEVCAPS) rescan();
-    if (msg == WIDM_GETNUMDEVS) return nwin;
-    if (id >= (UINT)nwin && msg != WIDM_CLOSE) return MMSYSERR_BADDEVICEID;
+    if (msg == WIDM_GETNUMDEVS) return inst_num(wins, nwin, DNOF(p1));
+    if (msg == WIDM_GETDEVCAPS || msg == WIDM_OPEN) {
+        g = inst_dev(wins, nwin, msg == WIDM_OPEN ? open_dn(p1, 16) : DNOF(p2), id);
+        if (g < 0) return MMSYSERR_BADDEVICEID;
+        id = (UINT)g;
+    }
     switch (msg) {
     case WIDM_GETDEVCAPS:
     {
@@ -933,11 +1074,11 @@ DWORD CALLBACK __loadds widMessage(UINT id, UINT msg, DWORD user, DWORD p1, DWOR
         fmemset(&c, 0, sizeof(c));
         c.wMid = 0x6033;
         c.wPid = (WORD)(0x20 + wins[id].type);
-        c.vDriverVersion = 0x0110;
+        c.vDriverVersion = 0x0120;
         fstrncpy(c.szPname, wins[id].name, MAXPNAMELEN);
         c.dwFormats = 0x0FFF;
         c.wChannels = 2;
-        fmemcpy((void FAR *)p1, &c, (WORD)MIN(p2, sizeof(c)));
+        caps_out(p1, p2, &c, sizeof(c));
         return MMSYSERR_NOERROR;
     }
     case WIDM_OPEN:
@@ -1032,10 +1173,16 @@ static void midi_alloff(struct mstream *m)
 DWORD CALLBACK __loadds modMessage(UINT id, UINT msg, DWORD user, DWORD p1, DWORD p2)
 {
     struct mstream *m;
+    int g;
     scan();
+    if (pnp_msg(msg, p2)) return MMSYSERR_NOERROR;
     if (msg == MODM_GETNUMDEVS || msg == MODM_OPEN || msg == MODM_GETDEVCAPS) rescan();
-    if (msg == MODM_GETNUMDEVS) return nmout;
-    if (id >= (UINT)nmout && msg != MODM_CLOSE) return MMSYSERR_BADDEVICEID;
+    if (msg == MODM_GETNUMDEVS) return inst_num(mouts, nmout, DNOF(p1));
+    if (msg == MODM_GETDEVCAPS || msg == MODM_OPEN || msg == MODM_GETVOLUME || msg == MODM_SETVOLUME) {
+        g = inst_dev(mouts, nmout, msg == MODM_OPEN ? open_dn(p1, 12) : DNOF(p2), id);
+        if (g < 0) return MMSYSERR_BADDEVICEID;
+        id = (UINT)g;
+    }
     switch (msg) {
     case MODM_GETDEVCAPS:
     {
@@ -1043,14 +1190,14 @@ DWORD CALLBACK __loadds modMessage(UINT id, UINT msg, DWORD user, DWORD p1, DWOR
         fmemset(&c, 0, sizeof(c));
         c.wMid = 0x6033;
         c.wPid = (WORD)(0x30 + mouts[id].ctl);
-        c.vDriverVersion = 0x0110;
+        c.vDriverVersion = 0x0120;
         fstrncpy(c.szPname, mouts[id].name, MAXPNAMELEN);
         c.wTechnology = mouts[id].ctl ? MOD_SYNTH : MOD_MIDIPORT;
         c.wVoices = mouts[id].ctl ? 32 : 0;
         c.wNotes = mouts[id].ctl ? 32 : 0;
         c.wChannelMask = 0xFFFF;
         c.dwSupport = mouts[id].ctl ? MIDICAPS_VOLUME | MIDICAPS_LRVOLUME : 0;
-        fmemcpy((void FAR *)p1, &c, (WORD)MIN(p2, sizeof(c)));
+        caps_out(p1, p2, &c, sizeof(c));
         return MMSYSERR_NOERROR;
     }
     case MODM_OPEN:
@@ -1115,7 +1262,8 @@ DWORD CALLBACK __loadds modMessage(UINT id, UINT msg, DWORD user, DWORD p1, DWOR
 
 DWORD CALLBACK __loadds midMessage(UINT id, UINT msg, DWORD user, DWORD p1, DWORD p2)
 {
-    (void)id; (void)user; (void)p1; (void)p2;
+    (void)id; (void)user; (void)p1;
+    if (pnp_msg(msg, p2)) return MMSYSERR_NOERROR;
     if (msg == MIDM_GETNUMDEVS) return 0;
     return MMSYSERR_NOTSUPPORTED;
 }
@@ -1124,10 +1272,14 @@ DWORD CALLBACK __loadds midMessage(UINT id, UINT msg, DWORD user, DWORD p1, DWOR
 
 DWORD CALLBACK __loadds auxMessage(UINT id, UINT msg, DWORD user, DWORD p1, DWORD p2)
 {
+    int g;
     (void)user;
     scan();
-    if (msg == AUXDM_GETNUMDEVS) return naux;
-    if (id >= (UINT)naux) return MMSYSERR_BADDEVICEID;
+    if (pnp_msg(msg, p2)) return MMSYSERR_NOERROR;
+    if (msg == AUXDM_GETNUMDEVS) return inst_num(auxs, naux, DNOF(p1));
+    g = inst_dev(auxs, naux, DNOF(p2), id);
+    if (g < 0) return MMSYSERR_BADDEVICEID;
+    id = (UINT)g;
     switch (msg) {
     case AUXDM_GETDEVCAPS:
     {
@@ -1135,11 +1287,11 @@ DWORD CALLBACK __loadds auxMessage(UINT id, UINT msg, DWORD user, DWORD p1, DWOR
         fmemset(&c, 0, sizeof(c));
         c.wMid = 0x6033;
         c.wPid = (WORD)(0x40 + auxs[id].ctl);
-        c.vDriverVersion = 0x0110;
+        c.vDriverVersion = 0x0120;
         fstrncpy(c.szPname, auxs[id].name, MAXPNAMELEN);
         c.wTechnology = auxs[id].ctl == MX_CD ? AUXCAPS_CDAUDIO : AUXCAPS_AUXIN;
         c.dwSupport = AUXCAPS_VOLUME | AUXCAPS_LRVOLUME;
-        fmemcpy((void FAR *)p1, &c, (WORD)MIN(p2, sizeof(c)));
+        caps_out(p1, p2, &c, sizeof(c));
         return MMSYSERR_NOERROR;
     }
     case AUXDM_GETVOLUME:
@@ -1179,10 +1331,24 @@ static void vol_save(int core, int id)
     if (lstrcmp(old, val)) WritePrivateProfileString(VOLSEC, key, val, sysini);
 }
 
+/* Windows 95, 98 and ME (INT 2Fh AX=1600h: AL 4): the VxD keeps the settings in the registry
+   and sets them before the devices start */
+static int win9x(void)
+{
+    BYTE major = 0;
+    _asm {
+        mov ax, 1600h
+        int 2Fh
+        mov major, al
+    }
+    return major >= 4 && major < 0x80;
+}
+
 static void vol_load(int core, int id)
 {
     char key[16], val[100], *p = val;
     int i;
+    if (win9x()) return;
     wsprintf(key, "Volume%d.%d", core, id);
     if (!GetPrivateProfileString(VOLSEC, key, "", val, sizeof(val), sysini)) return;
     for (i = 0; i < NSAVE; i++) {
@@ -1402,7 +1568,7 @@ static void fill_line(struct sdev *m, struct mln *t, int i, MXLINE FAR *out)
     }
     if (w) {
         x.wMid = 0x6033;
-        x.vDriverVersion = 0x0110;
+        x.vDriverVersion = 0x0120;
         fstrncpy(x.szPname, w->name, MAXPNAMELEN);
     }
     fmemcpy(out, &x, (WORD)MIN(out->cbStruct, sizeof(x)));
@@ -1583,14 +1749,24 @@ static void vol_changed(int core, int id, int ctl)
 DWORD CALLBACK __loadds mxdMessage(UINT id, UINT msg, DWORD user, DWORD p1, DWORD p2)
 {
     struct sdev *m;
+    int g;
     scan();
-    if (msg == MXDM_INIT) return MMSYSERR_NOERROR;
-    if (msg == MXDM_GETNUMDEVS) return nmix;
+    if (pnp_msg(msg, p2)) return MMSYSERR_NOERROR;
+    if (msg == MXDM_GETNUMDEVS || msg == MXDM_GETDEVCAPS || msg == MXDM_OPEN) rescan();
+    if (msg == MXDM_GETNUMDEVS) return inst_num(mixs, nmix, DNOF(p1));
     if (msg == MXDM_CLOSE) {
         if (user && user <= MAXMXOPEN) mxcl[(WORD)user - 1].used = 0;
         return MMSYSERR_NOERROR;
     }
-    if (id >= (UINT)nmix) return MMSYSERR_BADDEVICEID;
+    if (msg == MXDM_GETDEVCAPS || msg == MXDM_OPEN) {
+        g = inst_dev(mixs, nmix, msg == MXDM_OPEN ? open_dn(p1, 14) : DNOF(p2), id);
+    } else if (user && user <= MAXMXOPEN && mxcl[(WORD)user - 1].used) {
+        g = mxcl[(WORD)user - 1].mix;           /* through an open handle: the mixer opened */
+    } else {
+        g = inst_dev(mixs, nmix, 0, id);
+    }
+    if (g < 0 || g >= nmix) return MMSYSERR_BADDEVICEID;
+    id = (UINT)g;
     m = &mixs[id];
     switch (msg) {
     case MXDM_GETDEVCAPS:
@@ -1600,10 +1776,10 @@ DWORD CALLBACK __loadds mxdMessage(UINT id, UINT msg, DWORD user, DWORD p1, DWOR
         fmemset(&c, 0, sizeof(c));
         c.wMid = 0x6033;
         c.wPid = (WORD)(0x50 + m->type);
-        c.vDriverVersion = 0x0110;
+        c.vDriverVersion = 0x0120;
         fstrncpy(c.szPname, w ? w->name : m->name, MAXPNAMELEN);
         c.cDestinations = (DWORD)ndests(m);
-        fmemcpy((void FAR *)p1, &c, (WORD)MIN(p2, sizeof(c)));
+        caps_out(p1, p2, &c, sizeof(c));
         return MMSYSERR_NOERROR;
     }
     case MXDM_OPEN:

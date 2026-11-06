@@ -149,6 +149,13 @@ init:
         jne .nodisk
         mov al, [info+13]
 %ifdef PKG_USB
+        ; the USB drives found (WINUSB has no IDE / SATA drives: those are WINCD's)
+        push ax
+        add al, '0'
+        mov [msg_f], al
+        mov dx, msg_found
+        call print
+        pop ax
         call parse_n                    ; /N:n
         test ah, ah
         jz .havecnt
@@ -238,12 +245,19 @@ print:  push ax
         ret
 
 %ifdef PKG_USB
-msg_banner      db 'WINUCD 1.1 - USB CD/DVD drives of WINUSB for MSCDEX', 13, 10, '$'
+msg_banner      db 'WINUCD 1.2 - USB CD/DVD drives of WINUSB for MSCDEX', 13, 10, '$'
 %else
-msg_banner      db 'WINCD 1.1 - CD/DVD drives of WINDISK for MSCDEX', 13, 10, '$'
+msg_banner      db 'WINCD 1.2 - CD/DVD drives of WINDISK for MSCDEX', 13, 10, '$'
 %endif
+%ifdef PKG_USB
+msg_found       db CDSYS, ': '
+msg_f           db '0 USB CD/DVD drive(s) now (internal IDE / SATA drives: WINCD.SYS)', 13, 10, '$'
+msg_ok          db CDSYS, ': device ', DEVNAME, ', '
+msg_n           db '0 unit(s) for USB drives, plugged in now or later', 13, 10, '$'
+%else
 msg_ok          db CDSYS, ': device ', DEVNAME, ', '
 msg_n           db '0 unit(s)', 13, 10, '$'
+%endif
 msg_nodisk      db CDSYS, ': ', CORESYS, ' is not loaded (it must come first in CONFIG.SYS)', 13, 10, '$'
 %ifndef PKG_USB
 msg_nocd        db CDSYS, ': no CD/DVD drive found, not installed', 13, 10, '$'

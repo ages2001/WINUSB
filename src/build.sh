@@ -30,7 +30,7 @@ FWSRC=$SRC/firmware
 COMMON="winlib pci acpi blk corent"
 DISKSRC="ide ahci nvme cdrom sdhci"
 USBSRC="usb usbwdm uhci ohci ehci xhci hub hid ptp ps2tp kbc smbtp i2c dwi2c gpio msc uaudio uvc aeng synth nvme nhi tbt icm pcihp cdrom"
-AUDSRC="aeng synth sbemu opl3 hda afunc ac97 dsp dspipc4 dspipc3 dspdev dspcdc dspsst nhlt dwi2c sdw sdwlnk sdwstm sdwadv sdwrt71 sdwrt7l sdwamp sdwcs sdwmisc gpio cdces16 cdces26 cdcrt82 cdcrt10 cdcrt56 cdcrt63 cdcmax cdcda72 cdcnau cdccs42 cdctas cdcssm cdccx72 cdcm90 cdcrt86"
+AUDSRC="aeng synth sbemu opl3 hda afunc ac97 es137x emu10k dsp dspipc4 dspipc3 dspdev dspcdc dspsst nhlt dwi2c sdw sdwlnk sdwstm sdwadv sdwrt71 sdwrt7l sdwamp sdwcs sdwmisc gpio cdces16 cdces26 cdcrt82 cdcrt10 cdcrt56 cdcrt63 cdcmax cdcda72 cdcnau cdccs42 cdctas cdcssm cdccx72 cdcm90 cdcrt86"
 
 # build_pkg <name> <core files> <SYS name> <BIN name> <386 name> <C define> <NASM define> <Plug and Play files>
 HAVE_DISK=0; HAVE_USB=0; HAVE_AUDIO=0
@@ -60,9 +60,9 @@ build_pkg() {
   # WINAUDIO: the V86 monitor (VCPI server, DPMI host) of the DOS core
   local dosx=""
   if [ $pkg = audio ]; then
-    for f in vmon dpmi; do wcc386 $CF -I$SRC/dos -fo=$o/dos/$f.obj $SRC/dos/$f.c; done
+    for f in vmon dpmi ems; do wcc386 $CF -I$SRC/dos -fo=$o/dos/$f.obj $SRC/dos/$f.c; done
     nasm -f obj -o $o/dos/vmonent.obj $SRC/dos/vmonent.asm
-    dosx="vmon dpmi vmonent"
+    dosx="vmon dpmi ems vmonent"
   fi
   {
     echo "format raw bin"
@@ -89,7 +89,11 @@ build_pkg() {
     echo "name $1"
     echo "option nodefaultlibs, quiet, offset=0, map=$o/vxd/vxd.map"
     echo "library $WATCOM/lib386/dos/clib3r.lib"
-    echo "option description 'WINDRV $pkg driver core'"
+    case $pkg in
+      usb) echo "option description 'WINUSB USB, Thunderbolt and touchpad driver for Windows 3.x and 95/98/ME'" ;;
+      audio) echo "option description 'WINAUDIO HD Audio, AC97 and Intel DSP sound driver for Windows 3.x and 95/98/ME'" ;;
+      *) echo "option description 'WINDISK IDE, AHCI, NVMe and SD/eMMC disk driver for Windows 3.x and 95/98/ME'" ;;
+    esac
     echo "segment _LTEXT preload nondiscardable"
     echo "segment _LDATA preload nondiscardable"
     echo "export WINCORE_DDB.1"
@@ -139,7 +143,7 @@ if [ $HAVE_DISK = 1 ]; then
   cp $SRC/inf/WINDISK.INF $SRC/inf/WINDISKD.INF $SRC/inf/WINDISKC.INF $(dest disk)/
 fi
 if [ $HAVE_AUDIO = 1 ]; then
-  build_pkg audio "$COMMON $AUDSRC" WINAUDIO.SYS WINACORE.BIN WINAUDIO.386 "-DWIN_AUDIO" "-DPKG_AUDIO" "pnp pnpaud"
+  build_pkg audio "$COMMON $AUDSRC" WINAUDIO.SYS WINACORE.BIN WINAUDIO.386 "-DWIN_AUDIO" "-DPKG_AUDIO" "pnp pnpaud dsvxd"
   cp $SRC/inf/WINAUDIO.INF $SRC/inf/WINAUDM.INF $(dest audio)/
   # firmware of the Intel audio DSPs (SOF, AVS) and of SoundWire codecs: WINDRVFW next to the driver
   if [ -d $FWSRC ]; then
@@ -149,7 +153,7 @@ if [ $HAVE_AUDIO = 1 ]; then
 fi
 mkdir -p $OBJ/win $OBJ/tools
 if [ $HAVE_USB = 1 ]; then
-build_pkg usb "$COMMON $USBSRC" WINUSB.SYS WINUCORE.BIN WINUSB.386 "-DWIN_USB" "-DPKG_USB" "pnp pnpusb pnpblk ps2"
+build_pkg usb "$COMMON $USBSRC" WINUSB.SYS WINUCORE.BIN WINUSB.386 "-DWIN_USB" "-DPKG_USB" "pnp pnpusb pnpblk ps2 dsvxd"
 U=$(dest usb)
 
 # WINUSB.PDR: Windows 95/98/ME I/O Supervisor port driver (disks of WINUSB.VXD)
@@ -228,6 +232,24 @@ nasm -f obj -o $OBJ/win/winmouse.obj $SRC/win/winmouse.asm
   echo "import GetWinFlags KERNEL.132"
 } > $OBJ/win/winmouse.lnk
 wlink @$OBJ/win/winmouse.lnk
+# the same driver for Windows 1.x/2.x, linked into WIN100.BIN / WIN200.BIN by INSTUSB
+nasm -f obj -DOLDWIN -o $OBJ/win/winmou12.obj $SRC/win/winmouse.asm
+{
+  echo "format windows dll"
+  echo "name $U/WINMOU12.DRV"
+  echo "option modname=MOUSE"
+  echo "option description 'WINMOUSE USB and PS/2 mouse driver for Windows 1.x/2.x'"
+  echo "option quiet, map=$OBJ/win/winmou12.map"
+  echo "segment _TEXT preload fixed"
+  echo "segment _DATA preload fixed"
+  echo "file $OBJ/win/winmou12.obj"
+  echo "export Inquire.1, Enable.2, Disable.3, MouseGetIntVect.4"
+  echo "import GetVersion KERNEL.3"
+  echo "import GetModuleHandle KERNEL.47"
+  echo "import GetProcAddress KERNEL.50"
+} > $OBJ/win/winmou12.lnk
+wlink @$OBJ/win/winmou12.lnk
+python3 $TOOLS/nefix.py $U/WINMOU12.DRV 0
 WF="-q -ml -zw -bt=windows -ox -s -wx -I$WATCOM/h/win -I$SRC/inc -I$SRC/tools"
 wcc $WF -fo=$OBJ/win/winwheel.obj $SRC/win/winwheel.c
 (cd $SRC/win && wrc -q -r -bt=windows -I$WATCOM/h/win winwheel.rc -fo=$OBJ/win/winwheel.res)
@@ -370,7 +392,7 @@ if [ -f $SRC/win/winsound.c ] && { [ $HAVE_USB = 1 ] || [ $HAVE_AUDIO = 1 ]; }; 
     echo "format windows dll"
     echo "name $A/WINSOUND.DRV"
     echo "option modname=WINSOUND"
-    echo "option description 'wave,midi,aux,mixer:WINSOUND HD Audio, AC97 and USB Audio'"
+    echo "option description 'wave,midi,aux,mixer:WINSOUND HD Audio, AC97, Intel DSP and USB Audio'"
     echo "option quiet, map=$OBJ/win/winsound.map"
     echo "segment type CODE preload fixed"
     echo "segment type DATA preload fixed"

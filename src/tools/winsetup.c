@@ -26,6 +26,8 @@
 #include <dos.h>
 #include <direct.h>
 #include <io.h>
+#include <process.h>
+#include <conio.h>
 
 #ifdef WIN_USB
 #define PKG      "WINUSB"
@@ -75,8 +77,10 @@
 #define P_UDF   8
 #ifdef WIN_USB
 #define P_SELF  P_USB
+#define OTHERSND "WINAUDIO"
 #elif defined(WIN_AUDIO)
 #define P_SELF  P_AUD
+#define OTHERSND "WINUSB"
 #elif defined(WIN_UDF)
 #define P_SELF  P_UDF
 #else
@@ -85,7 +89,8 @@
 static const struct { const char *name; int need, pkgs; } pkgfiles[] = {
 #ifdef WIN_USB
     { "WINUSB.SYS", 1, P_USB }, { "WINUCORE.BIN", 1, P_USB }, { "WINUSB.386", 1, P_USB },
-    { "WINMOUSE.DRV", 1, P_USB }, { "WINWHEEL.EXE", 1, P_USB }, { "USBTREE.EXE", 0, P_USB },
+    { "WINMOUSE.DRV", 1, P_USB }, { "WINMOU12.DRV", 0, P_USB }, { "WINWHEEL.EXE", 1, P_USB },
+    { "USBTREE.EXE", 0, P_USB },
     { "WINCAM.EXE", 0, P_USB }, { "WINUCD.SYS", 0, P_USB },
     { "WINUSB.VXD", 0, P_USB }, { "WINUSB.PDR", 0, P_USB }, { "WINUSB.INF", 0, P_USB },
     { "WINUSBD.INF", 0, P_USB }, { "WINUSBH.INF", 0, P_USB }, { "WINUSBA.INF", 0, P_USB },
@@ -280,6 +285,9 @@ static char boot_drive(void)
 static int win9x_box;           /* running in a DOS box of Windows 95/98/ME */
 #ifndef UNINST
 static int dosdrv;              /* /DOS: the DOS driver in CONFIG.SYS of MS-DOS 7 too */
+#ifdef WIN_AUDIO
+static int dosonly;             /* /DOSONLY: the DOS driver alone, never in Windows */
+#endif
 #endif
 
 /* critical errors (sharing violation on a driver file Windows has open) fail the call
@@ -685,7 +693,7 @@ static int dev_line(const char *ln, const char *name, char *path, char *opts)
             return 0;
         memcpy(tok, s, n);
         tok[n] = 0;
-        if (stricmp(base(tok), name))
+        if (name && stricmp(base(tok), name))
             return 0;
         if (path)
             strcpy(path, tok);
@@ -777,6 +785,15 @@ static int cfg_install(const char *cfg, const char *dir, const char *uopts)
                 a = j;
         if (a < 0)
             continue;
+#ifdef WIN_USB
+        /* the USB drives get the letters after every drive of the other block device drivers
+           (DOS gives the letters in the order of CONFIG.SYS): after the last DEVICE line,
+           except the drivers that come after WINUSB.SYS */
+        for (j = a + 1; j < e; j++)
+            if (dev_line(t->l[j], NULL, NULL, NULL) && !dev_line(t->l[j], "WINAUDIO.SYS", NULL, NULL) &&
+                !dev_line(t->l[j], "WINUCD.SYS", NULL, NULL))
+                a = j;
+#endif
         ins = a + 1;
 #ifdef WIN_DISKPKG
         for (j = i; j < ins; j++)
@@ -1191,6 +1208,60 @@ static int win_select(const char *given, int verbose)
     return 0;
 }
 
+/* The Windows installations found, numbered: the user picks the ones to set up ("1",
+   "1,3", "A" all, "0" none). wins[] keeps the chosen ones; their count is returned. */
+static int win_choose(void)
+{
+    char line[80], *p;
+    unsigned char take[MAXWIN];
+    int i, k, n, any;
+    for (;;) {
+        printf("Windows installations found:\n");
+        for (i = 0; i < nwins; i++)
+            printf("  %d  %-24s %s\n", i + 1, wins[i].dir, win_name(&wins[i]));
+        printf("Set up which of them? Numbers (1%s), A = all, 0 = none (DOS driver only): ",
+               nwins > 1 ? " or 1,2" : "");
+        fflush(stdout);
+        if (!fgets(line, sizeof(line), stdin)) {
+            printf("\n");
+            return nwins;               /* no console input (redirected): all of them */
+        }
+        memset(take, 0, sizeof(take));
+        any = 0;
+        n = 1;
+        for (p = line; *p && n; p++) {
+            if (*p == ' ' || *p == ',' || *p == ';' || *p == '\t' || *p == '\r' || *p == '\n')
+                continue;
+            if (*p == 'a' || *p == 'A') {
+                memset(take, 1, sizeof(take));
+                any = 1;
+            } else if (*p >= '0' && *p <= '9') {
+                k = (int)strtol(p, &p, 10);
+                p--;
+                if (k == 0) {
+                    any = 1;
+                } else if (k <= nwins) {
+                    take[k - 1] = 1;
+                    any = 1;
+                } else {
+                    n = 0;
+                }
+            } else {
+                n = 0;
+            }
+        }
+        if (n && any)
+            break;
+        printf("Please answer with the numbers of the list.\n\n");
+    }
+    for (i = k = 0; i < nwins; i++)
+        if (take[i])
+            wins[k++] = wins[i];
+    nwins = k;
+    printf("\n");
+    return nwins;
+}
+
 #endif
 
 /* ---------------------------------------------------------------- INI files */
@@ -1430,14 +1501,22 @@ static void grp_install(TEXT *t, const char *spec)
 #define IC_BENCH    3
 #define IC_NOTE     4
 #define IC_CAMERA   5
+#define IC_UNUSB    6           /* uninstall: the package's icon with a red cross */
+#define IC_UNSPEAK  7
+#define IC_UNDISK   8
+
+#define GK_TOOL     0
+#define GK_README   1
+#define GK_UNINST   2
 
 struct gitem {
     char title[24];
-    char path[PMAX];
-    int icon;
+    char path[PMAX + 32];
+    char exe[PMAX];             /* the program alone (Windows 3.0 group: icon file) */
+    int icon, kind;
 };
 
-#define MAXGITEMS 6
+#define MAXGITEMS 8
 static struct gitem gitems[MAXGITEMS];
 static int ngitems;
 
@@ -1450,8 +1529,10 @@ static void grp_item(const char *dir, const char *file, const char *title, int i
     join(g->path, dir, file);
     if (!exists(g->path))
         return;
+    strcpy(g->exe, g->path);
     strcpy(g->title, title);
     g->icon = icon;
+    g->kind = GK_TOOL;
     ngitems++;
 }
 #endif
@@ -1465,8 +1546,29 @@ static void grp_readme(const char *dir, const char *title)
     if (ngitems >= MAXGITEMS || !exists(f) || strlen(f) + 12 >= PMAX)
         return;
     sprintf(g->path, "NOTEPAD.EXE %s", f);
+    strcpy(g->exe, "NOTEPAD.EXE");
     strcpy(g->title, title);
     g->icon = IC_NOTE;
+    g->kind = GK_README;
+    ngitems++;
+}
+
+/* Windows 3.x: the uninstaller is a DOS program; WINGRP.EXE /U closes Windows and runs it
+   (Windows 95/98/ME: the DOS box runs it directly, no item) */
+static void grp_uninst(const char *dir, int icon)
+{
+    struct gitem *g = &gitems[ngitems];
+    char u[PMAX];
+    if (ngitems >= MAXGITEMS)
+        return;
+    join(g->exe, dir, "WINGRP.EXE");
+    join(u, dir, UNINEXE);
+    if (!exists(g->exe) || !exists(u) || strlen(g->exe) + strlen(u) + 12 >= sizeof(g->path))
+        return;
+    sprintf(g->path, "%s /U " PKG " %s", g->exe, u);
+    strcpy(g->title, "Uninstall " PKG);
+    g->icon = icon;
+    g->kind = GK_UNINST;
     ngitems++;
 }
 
@@ -1474,11 +1576,11 @@ static void grp_readme(const char *dir, const char *title)
 #include "wicons.h"
 
 static const unsigned char *const ic_and[] = { ic_usb_and, ic_speaker_and, ic_disk_and, ic_bench_and, ic_note_and,
-                                               ic_camera_and };
+                                               ic_camera_and, ic_unusb_and, ic_unspeak_and, ic_undisk_and };
 static const unsigned char *const ic_x4[] = { ic_usb_x4, ic_speaker_x4, ic_disk_x4, ic_bench_x4, ic_note_x4,
-                                              ic_camera_x4 };
+                                              ic_camera_x4, ic_unusb_x4, ic_unspeak_x4, ic_undisk_x4 };
 static const unsigned char *const ic_x1[] = { ic_usb_x1, ic_speaker_x1, ic_disk_x1, ic_bench_x1, ic_note_x1,
-                                              ic_camera_x1 };
+                                              ic_camera_x1, ic_unusb_x1, ic_unspeak_x1, ic_undisk_x1 };
 
 static unsigned char grp[8192];
 static unsigned glen;
@@ -1555,15 +1657,15 @@ static int grp30_write(const struct winst *w)
         at = glen;
         glen += 24;
         g_w16(items + 2 * i, at);
-        g_w16(at, 21 + 75 * i);
-        g_w16(at + 2, 0);
-        g_w16(at + 4, 0);                       /* icon index in the program */
+        g_w16(at, 21 + 75 * (i % 4));           /* four in a row */
+        g_w16(at + 2, 70 * (i / 4));
+        g_w16(at + 4, g->kind == GK_UNINST ? g->icon : 0);  /* icon index in the program */
         g_w16(at + 6, 12);
         g_w16(at + 8, 128);
         g_w16(at + 10, planes == 4 ? 512 : 128);
         g_w16(at + 18, g_put(g->title, strlen(g->title) + 1));
         g_w16(at + 20, g_put(g->path, strlen(g->path) + 1));
-        g_w16(at + 22, g_put(g->path, strlen(g->path) + 1));
+        g_w16(at + 22, g_put(g->exe, strlen(g->exe) + 1));
         h12[10] = (unsigned char)planes;
         g_w16(at + 12, g_put(h12, 12));         /* hot spot, size, mask row bytes, format */
         g_w16(at + 14, g_put(ic_and[g->icon], 128));
@@ -1601,6 +1703,195 @@ static int grp30_write(const struct winst *w)
     return 0;
 }
 
+/* ---- Windows 95/98/ME: shortcuts of the programs on the desktop ----
+   A shell link (.LNK) that Windows 95 and later resolve from the path alone: header, link
+   info with the local path, working directory, icon from WINGRP.EXE. The long name ("USB
+   Devices.lnk") needs the long file name API of a DOS box; plain DOS writes the 8.3 name of
+   the program. */
+static unsigned char __far lnkbuf[600];
+static unsigned lnklen;
+
+static void lnk_put(const void *p, unsigned n)
+{
+    if (lnklen + n <= sizeof(lnkbuf)) {
+        memcpy(lnkbuf + lnklen, p, n);
+        lnklen += n;
+    }
+}
+
+static void lnk_w32(unsigned long v)
+{
+    unsigned char b[4];
+    b[0] = (unsigned char)v;
+    b[1] = (unsigned char)(v >> 8);
+    b[2] = (unsigned char)(v >> 16);
+    b[3] = (unsigned char)(v >> 24);
+    lnk_put(b, 4);
+}
+
+static void lnk_str(const char *t)
+{
+    unsigned n = strlen(t);
+    unsigned char b[2];
+    b[0] = (unsigned char)n;
+    b[1] = (unsigned char)(n >> 8);
+    lnk_put(b, 2);
+    lnk_put(t, n);
+}
+
+static void lnk_make(const char *target, const char *args, const char *wdir, const char *icon, int index)
+{
+    static const unsigned char clsid[16] = { 0x01, 0x14, 0x02, 0, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46 };
+    unsigned long flags = 0x02 | 0x10 | 0x40;   /* link info, working directory, icon location */
+    unsigned li, i;
+    if (args[0])
+        flags |= 0x20;
+    lnklen = 0;
+    lnk_w32(0x4C);
+    lnk_put(clsid, 16);
+    lnk_w32(flags);
+    lnk_w32(0x20);                              /* attributes of the target */
+    for (i = 0; i < 7; i++)                     /* three times, file size */
+        lnk_w32(0);
+    lnk_w32((unsigned long)index);
+    lnk_w32(1);                                 /* show normal */
+    lnk_w32(0);                                 /* hot key, reserved */
+    lnk_w32(0);
+    lnk_w32(0);
+    /* link info: volume ID (fixed disk, no label), local base path */
+    li = 0x1C + 0x11 + strlen(target) + 1;
+    lnk_w32(li + 1);
+    lnk_w32(0x1C);
+    lnk_w32(1);
+    lnk_w32(0x1C);
+    lnk_w32(0x1C + 0x11);
+    lnk_w32(0);
+    lnk_w32(li);
+    lnk_w32(0x11);
+    lnk_w32(3);
+    lnk_w32(0);
+    lnk_w32(0x10);
+    lnk_put("", 1);
+    lnk_put(target, strlen(target) + 1);
+    lnk_put("", 1);
+    lnk_str(wdir);
+    if (args[0])
+        lnk_str(args);
+    lnk_str(icon);
+    lnk_w32(0);
+}
+
+/* long file names in this DOS (a DOS box of Windows 95/98/ME) */
+static int lfn_api(char drive)
+{
+    union REGS r;
+    struct SREGS sr;
+    static char root[] = "C:\\", fs[16];
+    segread(&sr);
+    r.x.ax = 0x71A0;
+    r.x.cx = sizeof(fs);
+    root[0] = drive;
+    sr.ds = FP_SEG(root);
+    r.x.dx = FP_OFF(root);
+    sr.es = FP_SEG(fs);
+    r.x.di = FP_OFF(fs);
+    r.x.cflag = 1;
+    intdosx(&r, &r, &sr);
+    return !r.x.cflag && r.x.ax != 0x7100;
+}
+
+static int lnk_write(const char *path, int lfn)
+{
+    union REGS r;
+    struct SREGS sr;
+    int h;
+    if (!lfn) {
+        FILE *fp = fopen(path, "wb");
+        if (!fp)
+            return -1;
+        h = fwrite(lnkbuf, 1, lnklen, fp) != lnklen;
+        return (fclose(fp) || h) ? -1 : 0;
+    }
+    segread(&sr);
+    r.x.ax = 0x716C;                            /* create or truncate */
+    r.x.bx = 0x0001;
+    r.x.cx = 0;
+    r.x.dx = 0x0012;
+    sr.ds = FP_SEG(path);
+    r.x.si = FP_OFF(path);
+    r.x.cflag = 1;
+    intdosx(&r, &r, &sr);
+    if (r.x.cflag)
+        return -1;
+    h = r.x.ax;
+    r.h.ah = 0x40;
+    r.x.bx = h;
+    r.x.cx = lnklen;
+    sr.ds = FP_SEG(lnkbuf);
+    r.x.dx = FP_OFF(lnkbuf);
+    intdosx(&r, &r, &sr);
+    lfn = r.x.cflag || r.x.ax != lnklen;
+    r.h.ah = 0x3E;
+    r.x.bx = h;
+    intdos(&r, &r);
+    return lfn ? -1 : 0;
+}
+
+/* WIN.INI [WinDrv] Links.<package>=USBTREE.LNK|USB Devices;...: WINGRP.EXE gives the
+   shortcuts written in plain DOS their long names at the next start of Windows */
+static void links_install(TEXT *t, const char *spec)
+{
+    ini_set(t, GRPSEC, "Links." PKG, spec);
+}
+
+static void desktop_links(const struct winst *w)
+{
+    static char spec[VMAX];
+    char desk[PMAX], f[PMAX + 32], wdir[PMAX], icon[PMAX], nm[16];
+    int i, lfn = lfn_api(w->dir[0]), made = 0;
+    char *dot;
+    spec[0] = 0;
+    join(desk, w->dir, "DESKTOP");
+    if (!isdir(desk))
+        return;
+    for (i = 0; i < ngitems; i++) {
+        struct gitem *g = &gitems[i];
+        if (g->kind != GK_TOOL)
+            continue;
+        dir_of(wdir, g->exe);
+        join(icon, wdir, "WINGRP.EXE");
+        if (!exists(icon))
+            continue;
+        if (lfn) {
+            join(f, desk, g->title);
+            strcat(f, ".lnk");
+        } else {
+            strcpy(nm, base(g->exe));
+            if ((dot = strchr(nm, '.')) != NULL)
+                *dot = 0;
+            strcat(nm, ".LNK");
+            join(f, desk, nm);
+        }
+        lnk_make(g->exe, "", wdir, icon, g->icon);
+        if (lnk_write(f, lfn)) {
+            printf("  Cannot write the desktop shortcut %s\n", f);
+            continue;
+        }
+        made++;
+        if (!lfn && strlen(spec) + strlen(nm) + strlen(g->title) + 3 < sizeof(spec)) {
+            if (spec[0])
+                strcat(spec, ";");
+            strcat(spec, nm);
+            strcat(spec, "|");
+            strcat(spec, g->title);
+        }
+    }
+    if (made)
+        printf("  %d shortcut(s) on the desktop (%s)\n", made, desk);
+    if (spec[0])
+        ini_edit(w->dir, "WIN.INI", links_install, spec);
+}
+
 /* the programs of the package: a Program Manager group (Windows 3.0 and 3.1, written here
    or made by WINGRP.EXE at the next start) or a Start Menu group (Windows 95/98/ME: WINGRP.EXE
    asks the shell the same way at the next start). The group is made again on every install,
@@ -1631,6 +1922,17 @@ static int group_install(const struct winst *w, const char *dir)
     grp_item(dir, "DSKBENCH.EXE", "Disk Benchmark", IC_BENCH);
 #endif
     grp_readme(dir, PKG " Read Me");
+    if (IS9X(w)) {
+        desktop_links(w);
+    } else {
+#ifdef WIN_USB
+        grp_uninst(dir, IC_UNUSB);
+#elif defined(WIN_AUDIO)
+        grp_uninst(dir, IC_UNSPEAK);
+#else
+        grp_uninst(dir, IC_UNDISK);
+#endif
+    }
     if (!ngitems)
         return 0;
     if (w->ver == WV_30)
@@ -1740,6 +2042,45 @@ static void startmenu_remove(const char *win)
         if (rmdir(g) == 0)
             printf("  Start Menu group %s removed\n", g);
     } while (!_dos_findnext(&f1));
+}
+
+/* Windows 95/98/ME: the desktop shortcuts whose program in 'dir' is gone (the files of
+   another package in the same directory keep theirs) */
+static void desktop_remove(const struct winst *w, const char *dir)
+{
+    static unsigned char b[1024];
+    struct find_t ff;
+    char pat[PMAX], f[PMAX], *t;
+    unsigned n, off, li, dl = strlen(dir);
+    FILE *fp;
+    if (!dl || strlen(w->dir) + 20 >= PMAX)
+        return;
+    sprintf(pat, "%s\\DESKTOP\\*.LNK", w->dir);
+    if (_dos_findfirst(pat, _A_NORMAL | _A_RDONLY | _A_ARCH, &ff))
+        return;
+    do {
+        sprintf(f, "%s\\DESKTOP\\%s", w->dir, ff.name);
+        if (!(fp = fopen(f, "rb")))
+            continue;
+        n = fread(b, 1, sizeof(b) - 1, fp);
+        fclose(fp);
+        b[n] = 0;
+        if (n < 0x4C + 0x1C || b[0] != 0x4C || !(b[0x14] & 0x02))
+            continue;
+        off = 0x4C;
+        if (b[0x14] & 0x01)                     /* item ID list first */
+            off += 2 + (b[off] | (b[off + 1] << 8));
+        if (off + 0x1C > n || !(b[off + 8] & 1))
+            continue;
+        li = b[off + 16] | (b[off + 17] << 8);  /* local base path */
+        if (off + li >= n)
+            continue;
+        t = (char *)b + off + li;
+        if (strnicmp(t, dir, dl) || t[dl] != '\\' || exists(t))
+            continue;
+        if (del_file(f) == 0)
+            printf("  desktop shortcut %s deleted\n", f);
+    } while (!_dos_findnext(&ff));
 }
 
 static int group_remove(const struct winst *w)
@@ -2091,6 +2432,371 @@ static int windows_remove(const struct winst *w)
 #endif /* sound */
 
 #ifdef WIN_USB
+/* ---- Windows 1.x/2.x: the mouse driver linked into WIN100.BIN / WIN200.BIN ----
+   Windows 1.x/2.x Setup links the core modules (KERNEL ... MOUSE ... USER) into WIN100.BIN /
+   WIN200.BIN and WIN100.OVL / WIN200.OVL; without a mouse chosen in Setup, the MOUSE module
+   is a stub and Windows shows no pointer at all.
+    - .BIN: KERNEL's DOS header, then per module the NE header with its tables (without the
+      non-resident names), the PRELOAD segments (with their relocation records) and the
+      PRELOAD resources, each on a paragraph boundary; NE+08h holds the paragraph of the
+      next module (0 = end),
+    - .OVL: per module the non-resident names (NE+2Ch = paragraph in the .OVL), the segments
+      that are not preloaded and a copy of every resource and of every preloaded
+      discardable segment (to reload them),
+    - segment / resource offsets are paragraphs in the .BIN for preloaded objects and in the
+      .OVL otherwise; for preloaded discardable segments the minimum allocation field and for
+      preloaded resources the reserved handle field hold the paragraph of the .OVL copy.
+   INSTUSB replaces the MOUSE module with WINMOU12.DRV (WINMOUSE built for Windows 1.x/2.x):
+   its .OVL part is appended to the .OVL, the modules after it move in the .BIN. The files as
+   they were are kept as WIN?00.WUB / WIN?00.WUO; UNINUSB links their MOUSE module back. */
+#define NE_PRELOAD 0x0040
+#define NE_DISCARD 0x1000
+#define NE_RELOCS  0x0100
+#define MAXSEG     16
+#define MAXRES     64
+
+static unsigned char __far nehdr[0x800];   /* far: DGROUP is full */
+static char __far cbuf[4096];
+
+static unsigned rdw(const unsigned char *p)
+{
+    return p[0] | (p[1] << 8);
+}
+
+static void wrw(unsigned char *p, unsigned v)
+{
+    p[0] = (unsigned char)v;
+    p[1] = (unsigned char)(v >> 8);
+}
+
+static unsigned fgetw(FILE *f, long pos)
+{
+    unsigned char b[2] = { 0, 0 };
+    fseek(f, pos, SEEK_SET);
+    fread(b, 1, 2, f);
+    return rdw(b);
+}
+
+static int fcopy(FILE *o, FILE *i, long pos, long n)
+{
+    fseek(i, pos, SEEK_SET);
+    while (n > 0) {
+        size_t k = n > (long)sizeof(cbuf) ? sizeof(cbuf) : (size_t)n;
+        if (fread(cbuf, 1, k, i) != k || fwrite(cbuf, 1, k, o) != k)
+            return 0;
+        n -= k;
+    }
+    return 1;
+}
+
+static long fpad(FILE *o)
+{
+    long p = ftell(o);
+    while (p & 15) {
+        fputc(0, o);
+        p++;
+    }
+    return p;
+}
+
+static long pad16(long n)
+{
+    return (n + 15) & ~15L;
+}
+
+/* position of the module 'name' in the .BIN and of the next module */
+static int find_module(FILE *b, const char *name, long *start, long *end)
+{
+    long ne = 0x400;
+    unsigned len = strlen(name);
+    int n;
+    for (n = 0; n < 64; n++) {
+        unsigned char h[0x40], nm[16];
+        unsigned nxt, rn;
+        fseek(b, ne, SEEK_SET);
+        if (fread(h, 1, 0x40, b) != 0x40 || h[0] != 'N' || h[1] != 'E')
+            return 0;
+        nxt = rdw(h + 8);
+        rn = rdw(h + 0x26);
+        fseek(b, ne + rn, SEEK_SET);
+        fread(nm, 1, sizeof(nm), b);
+        if (nm[0] == len && !memcmp(nm + 1, name, len)) {
+            *start = ne;
+            *end = (long)nxt << 4;
+            return nxt != 0;
+        }
+        if (!nxt)
+            return 0;
+        ne = (long)nxt << 4;
+    }
+    return 0;
+}
+
+/* the description of the module (first non-resident name, in the .OVL); "" if none */
+static void module_desc(const char *binp, const char *ovlp, const char *name, char *out, unsigned max)
+{
+    FILE *b = fopen(binp, "rb"), *o = fopen(ovlp, "rb");
+    long s, e;
+    unsigned n;
+    out[0] = 0;
+    if (b && o && find_module(b, name, &s, &e)) {
+        fseek(o, (long)fgetw(b, s + 0x2C) << 4, SEEK_SET);
+        n = fgetc(o) & 0xFF;
+        if (n >= max)
+            n = max - 1;
+        n = fread(out, 1, n, o);
+        out[n] = 0;
+    }
+    if (b)
+        fclose(b);
+    if (o)
+        fclose(o);
+}
+
+/* add delta paragraphs to the .BIN offsets of the modules from ne on */
+static int shift_modules(FILE *f, long ne, int delta)
+{
+    int n;
+    for (n = 0; n < 64 && ne; n++) {
+        unsigned char h[0x40];
+        unsigned nxt, segtab, restab, resnam, nseg, i;
+        fseek(f, ne, SEEK_SET);
+        if (fread(h, 1, 0x40, f) != 0x40)
+            return 0;
+        if (h[0] != 'N' || h[1] != 'E')
+            return 1;                           /* end block (zeros) */
+        nxt = rdw(h + 8);
+        if (nxt)
+            wrw(h + 8, nxt + delta);
+        fseek(f, ne, SEEK_SET);
+        fwrite(h, 1, 0x40, f);
+        segtab = rdw(h + 0x22);
+        restab = rdw(h + 0x24);
+        resnam = rdw(h + 0x26);
+        nseg = rdw(h + 0x1C);
+        if (nseg * 8U > sizeof(cbuf))
+            return 0;
+        fseek(f, ne + segtab, SEEK_SET);
+        fread(cbuf, 1, nseg * 8, f);
+        for (i = 0; i < nseg; i++) {
+            unsigned char *e = (unsigned char *)cbuf + i * 8;
+            if (rdw(e) && (rdw(e + 4) & NE_PRELOAD))
+                wrw(e, rdw(e) + delta);
+        }
+        fseek(f, ne + segtab, SEEK_SET);
+        fwrite(cbuf, 1, nseg * 8, f);
+        if (resnam > restab + 2) {
+            unsigned len = resnam - restab, q = 2;
+            if (len > sizeof(cbuf))
+                return 0;
+            fseek(f, ne + restab, SEEK_SET);
+            fread(cbuf, 1, len, f);
+            while (q + 8 <= len && rdw((unsigned char *)cbuf + q)) {
+                unsigned cnt = rdw((unsigned char *)cbuf + q + 2), j;
+                q += 8;
+                for (j = 0; j < cnt && q + 12 <= len; j++, q += 12) {
+                    unsigned char *e = (unsigned char *)cbuf + q;
+                    if (rdw(e + 4) & NE_PRELOAD)
+                        wrw(e, rdw(e) + delta);
+                }
+            }
+            fseek(f, ne + restab, SEEK_SET);
+            fwrite(cbuf, 1, len, f);
+        }
+        ne = nxt ? ((long)(nxt + delta) << 4) : 0;
+    }
+    return 1;
+}
+
+/* <binp>/<ovlp> made from srcb/srco with the NE file drv as module 'name' (srcb / srco may
+   be binp / ovlp themselves); 0 = error, the files are not changed then */
+static int link_module(const char *drv, const char *srcb, const char *srco, const char *binp,
+                       const char *ovlp, const char *name)
+{
+    FILE *d = 0, *b = 0, *o = 0, *nb = 0, *no = 0;
+    static char tb[PMAX], to[PMAX];
+    static long segpos[MAXSEG], segsz[MAXSEG], respos[MAXRES], ressz[MAXRES];
+    long ne, nonres, start, end, cur, opos, ovlend, binlen;
+    unsigned hl, nseg, segtab, restab, resnam, i, nres = 0, q, nonreslen;
+    int ok = 0;
+    dir_of(tb, binp);
+    join(to, tb, "WINUSB.$O$");
+    join(tb, tb, "WINUSB.$B$");
+    d = fopen(drv, "rb");
+    b = fopen(srcb, "rb");
+    o = fopen(srco, "rb");
+    if (!d || !b || !o || fgetw(d, 0) != 0x5A4D)
+        goto out;
+    ne = fgetw(d, 0x3C) | ((long)fgetw(d, 0x3E) << 16);
+    fseek(d, ne, SEEK_SET);
+    if (fread(nehdr, 1, 0x40, d) != 0x40 || nehdr[0] != 'N' || nehdr[1] != 'E')
+        goto out;
+    nonres = rdw(nehdr + 0x2C) | ((long)rdw(nehdr + 0x2E) << 16);
+    if (nonres <= ne || nonres - ne > (long)sizeof(nehdr))
+        goto out;
+    hl = (unsigned)(nonres - ne);
+    fseek(d, ne, SEEK_SET);
+    fread(nehdr, 1, hl, d);
+    nonreslen = rdw(nehdr + 0x20);
+    nseg = rdw(nehdr + 0x1C);
+    segtab = rdw(nehdr + 0x22);
+    restab = rdw(nehdr + 0x24);
+    resnam = rdw(nehdr + 0x26);
+    if (nseg > MAXSEG || rdw(nehdr + 0x32) != 4 || !find_module(b, name, &start, &end))
+        goto out;
+    fseek(b, 0, SEEK_END);
+    binlen = ftell(b);
+    fseek(o, 0, SEEK_END);
+    ovlend = pad16(ftell(o));
+    /* layout */
+    cur = start + pad16(hl);
+    opos = ovlend;
+    wrw(nehdr + 0x2C, (unsigned)(opos >> 4));
+    wrw(nehdr + 0x2E, 0);
+    opos += pad16(nonreslen);
+    for (i = 0; i < nseg; i++) {
+        unsigned char *e = nehdr + segtab + i * 8;
+        unsigned fl = rdw(e + 4);
+        segpos[i] = (long)rdw(e) << 4;
+        segsz[i] = 0;
+        if (!segpos[i])
+            continue;
+        segsz[i] = rdw(e + 2) ? rdw(e + 2) : 0x10000L;
+        if (fl & NE_RELOCS)
+            segsz[i] += 2 + 8L * fgetw(d, segpos[i] + segsz[i]);
+        if (fl & NE_PRELOAD) {
+            wrw(e, (unsigned)(cur >> 4));
+            cur += pad16(segsz[i]);
+            if (fl & NE_DISCARD) {
+                wrw(e + 6, (unsigned)(opos >> 4));
+                opos += pad16(segsz[i]);
+            }
+        } else {
+            wrw(e, (unsigned)(opos >> 4));
+            opos += pad16(segsz[i]);
+        }
+    }
+    if (resnam > restab + 2) {
+        if (rdw(nehdr + restab) != 4)
+            goto out;
+        q = restab + 2;
+        while (q + 8 <= resnam && rdw(nehdr + q)) {
+            unsigned cnt = rdw(nehdr + q + 2), j;
+            q += 8;
+            for (j = 0; j < cnt; j++, q += 12) {
+                unsigned char *e = nehdr + q;
+                if (nres >= MAXRES)
+                    goto out;
+                respos[nres] = (long)rdw(e) << 4;
+                ressz[nres] = (long)rdw(e + 2) << 4;
+                if (rdw(e + 4) & NE_PRELOAD) {
+                    wrw(e, (unsigned)(cur >> 4));
+                    cur += ressz[nres];
+                    wrw(e + 8, (unsigned)(opos >> 4));
+                } else {
+                    wrw(e, (unsigned)(opos >> 4));
+                    wrw(e + 8, 0);
+                }
+                opos += ressz[nres];
+                nres++;
+            }
+        }
+    }
+    wrw(nehdr + 8, (unsigned)(cur >> 4));       /* next module */
+    nehdr[0x0A] = nehdr[0x0B] = 0;
+    /* new .BIN */
+    nb = fopen(tb, "w+b");
+    no = fopen(to, "wb");
+    if (!nb || !no || !fcopy(nb, b, 0, start))
+        goto out;
+    fwrite(nehdr, 1, hl, nb);
+    fpad(nb);
+    for (i = 0; i < nseg; i++)
+        if (segpos[i] && (rdw(nehdr + segtab + i * 8 + 4) & NE_PRELOAD)) {
+            if (!fcopy(nb, d, segpos[i], segsz[i]))
+                goto out;
+            fpad(nb);
+        }
+    q = restab + 2;
+    nres = 0;
+    if (resnam > restab + 2)
+        while (q + 8 <= resnam && rdw(nehdr + q)) {
+            unsigned cnt = rdw(nehdr + q + 2), j;
+            q += 8;
+            for (j = 0; j < cnt; j++, q += 12, nres++)
+                if (rdw(nehdr + q + 4) & NE_PRELOAD) {
+                    if (!fcopy(nb, d, respos[nres], ressz[nres]))
+                        goto out;
+                    fpad(nb);
+                }
+        }
+    if (ftell(nb) != cur || !fcopy(nb, b, end, binlen - end))
+        goto out;
+    binlen = ftell(nb);
+    if (!shift_modules(nb, cur, (int)((cur - end) >> 4)))
+        goto out;
+    {   /* KERNEL's DOS header describes the whole file */
+        unsigned char m[4];
+        wrw(m, (unsigned)(binlen % 512));
+        wrw(m + 2, (unsigned)((binlen + 511) / 512));
+        fseek(nb, 2, SEEK_SET);
+        fwrite(m, 1, 4, nb);
+    }
+    /* new .OVL: the old one and the module's part */
+    fseek(o, 0, SEEK_END);
+    if (!fcopy(no, o, 0, ftell(o)))
+        goto out;
+    fpad(no);
+    if (!fcopy(no, d, nonres, nonreslen))
+        goto out;
+    fpad(no);
+    for (i = 0; i < nseg; i++) {
+        unsigned fl = rdw(nehdr + segtab + i * 8 + 4);
+        if (segpos[i] && (!(fl & NE_PRELOAD) || (fl & NE_DISCARD))) {
+            if (!fcopy(no, d, segpos[i], segsz[i]))
+                goto out;
+            fpad(no);
+        }
+    }
+    for (i = 0; i < nres; i++)
+        if (!fcopy(no, d, respos[i], ressz[i]))
+            goto out;
+    if (ftell(no) != opos)
+        goto out;
+    ok = 1;
+out:
+    if (d)
+        fclose(d);
+    if (b)
+        fclose(b);
+    if (o)
+        fclose(o);
+    if (nb && fclose(nb))
+        ok = 0;
+    if (no && fclose(no))
+        ok = 0;
+    if (ok) {
+        remove(binp);
+        remove(ovlp);
+        ok = !rename(tb, binp) && !rename(to, ovlp);
+    } else {
+        remove(tb);
+        remove(to);
+    }
+    return ok;
+}
+
+static void old_names(const struct winst *w, char *binp, char *ovlp, char *wub, char *wuo)
+{
+    const char *v = w->ver == WV_1X ? "WIN100" : "WIN200";
+    sprintf(binp, "%s\\%s.BIN", w->dir, v);
+    sprintf(ovlp, "%s\\%s.OVL", w->dir, v);
+    sprintf(wub, "%s\\%s.WUB", w->dir, v);
+    sprintf(wuo, "%s\\%s.WUO", w->dir, v);
+}
+#endif
+
+#ifdef WIN_USB
 #ifndef UNINST
 static void sys_install(TEXT *t, const char *unused)
 {
@@ -2131,6 +2837,67 @@ static void win_install(TEXT *t, const char *wheel)
         ini_set(t, "WinWheel", "Invert", "0");
 }
 
+/* bytes of code and data of the module 'name' in the .BIN; -1 when it is not there */
+static long module_size(const char *binp, const char *name)
+{
+    FILE *b = fopen(binp, "rb");
+    long s, e, sum = -1;
+    unsigned nseg, segtab, i, ln;
+    if (!b)
+        return -1;
+    if (find_module(b, name, &s, &e)) {
+        nseg = fgetw(b, s + 0x1C);
+        segtab = fgetw(b, s + 0x22);
+        for (sum = 0, i = 0; i < nseg && i < 64; i++) {
+            ln = fgetw(b, s + segtab + i * 8 + 2);
+            sum += ln ? ln : 0x10000L;
+        }
+    }
+    fclose(b);
+    return sum;
+}
+
+/* Windows 1.x/2.x: without a mouse chosen in Setup the MOUSE module is a stub of a few bytes
+   and there is no pointer: WINMOU12.DRV (USB mice through WINUSB.SYS, PS/2 mice through the
+   8042) takes its place. A mouse driver Setup put there stays (USB mice reach the PS/2 one
+   through the 8042). */
+static int old_mouse_install(const struct winst *w, const char *dir)
+{
+    char binp[PMAX], ovlp[PMAX], wub[PMAX], wuo[PMAX], drv[PMAX], desc[80];
+    long size;
+    old_names(w, binp, ovlp, wub, wuo);
+    join(drv, dir, "WINMOU12.DRV");
+    if (!exists(binp) || !exists(ovlp) || !exists(drv)) {
+        printf("  %s, %s or %s missing: the mouse driver is left as it is\n", binp, ovlp, drv);
+        return 0;
+    }
+    module_desc(binp, ovlp, "MOUSE", desc, sizeof(desc));
+    size = module_size(binp, "MOUSE");
+    if (size < 0) {
+        warn("%s has no MOUSE module: the mouse driver is left as it is", binp);
+        return 0;
+    }
+    if (!strstr(desc, "WINMOUSE")) {
+        if (size > 256) {
+            printf("  Mouse: the driver chosen in Setup stays (%s); USB mice reach it\n"
+                   "  through the PS/2 port when it is the PS/2 mouse driver\n", desc[0] ? desc : "MOUSE");
+            return 0;
+        }
+        if (copy_file(binp, wub) || copy_file(ovlp, wuo)) {
+            printf("  Cannot write %s / %s\n", wub, wuo);
+            return -1;
+        }
+        printf("  %s, %s saved as %s, %s\n", binp, ovlp, base(wub), base(wuo));
+    }
+    if (!link_module(drv, binp, ovlp, binp, ovlp, "MOUSE")) {
+        printf("  Cannot link WINMOU12.DRV into %s (disk full or unknown format);\n"
+               "  the files of Windows were not changed\n", binp);
+        return -1;
+    }
+    printf("  WINMOU12.DRV linked into %s as the mouse driver (USB and PS/2 mice)\n", binp);
+    return 0;
+}
+
 static int w9x_install(const struct winst *w, const char *dir);
 static void drv9x_install(TEXT *t, const char *unused);
 
@@ -2143,18 +2910,14 @@ static int windows_install(const struct winst *w, const char *dir)
         return w9x_install(w, dir);
     if (w->ver < WV_30) {
         /* the drivers of Windows 1.x/2.x are bound into WIN100/WIN200.BIN by their Setup;
-           USB keyboards and mice reach them through the PS/2 (8042) port. The 32-bit core
-           runs in DOS and in the real-mode copy of Windows; Windows/386 (WIN386) puts the
-           CPU in V86 mode without a VCPI server, so the core is suspended while it runs. */
-        if (w->ver == WV_1X)
-            printf("  USB keyboards and USB disks work; Windows 1.0x has no PS/2 mouse driver.\n");
-        else
-            printf("  USB keyboards, mice and disks work; the mouse needs the PS/2 mouse driver\n"
-                   "  (\"Microsoft Mouse connected to PS/2 Mouse Port\" in Setup).\n");
+           USB keyboards reach the keyboard driver through the PS/2 (8042) port, the mouse
+           driver is linked in here. The 32-bit core runs in DOS and in the real-mode copy of
+           Windows; Windows/386 (WIN386) puts the CPU in V86 mode without a VCPI server, so
+           the core is suspended while it runs. */
         if (w->ver == WV_386)
             printf("  Windows/386 (WIN386) suspends USB while it runs (V86 mode, no VCPI);\n"
                    "  run the real-mode copy (WIN86.COM) for USB inside Windows.\n");
-        return 0;
+        return old_mouse_install(w, dir);
     }
     join(src, dir, "WINMOUSE.DRV");
     sprintf(dst, "%s\\SYSTEM\\WINMOUSE.DRV", win);
@@ -2175,6 +2938,116 @@ static int windows_install(const struct winst *w, const char *dir)
 }
 #else
 static int mouse_restored;
+
+/* the module 'name' of srcb / srco (WIN?00.BIN / .OVL) as an NE file again */
+static int extract_module(const char *srcb, const char *srco, const char *name, const char *outp)
+{
+    static unsigned char mz[0x40];
+    FILE *b = fopen(srcb, "rb"), *o = fopen(srco, "rb"), *f = 0;
+    long s, e, pos, sz;
+    unsigned hl, nseg, segtab, restab, resnam, i, q, fl, off;
+    int ok = 0;
+    if (!b || !o || !find_module(b, name, &s, &e))
+        goto out;
+    fseek(b, s, SEEK_SET);
+    if (fread(nehdr, 1, 0x40, b) != 0x40)
+        goto out;
+    hl = rdw(nehdr + 4) + rdw(nehdr + 6);       /* the entry table ends the resident tables */
+    if (hl < 0x40 || hl > sizeof(nehdr) || hl > e - s)
+        goto out;
+    fseek(b, s, SEEK_SET);
+    fread(nehdr, 1, hl, b);
+    nseg = rdw(nehdr + 0x1C);
+    segtab = rdw(nehdr + 0x22);
+    restab = rdw(nehdr + 0x24);
+    resnam = rdw(nehdr + 0x26);
+    if (nseg > MAXSEG || !(f = fopen(outp, "w+b")))
+        goto out;
+    memset(mz, 0, sizeof(mz));
+    mz[0] = 'M';
+    mz[1] = 'Z';
+    mz[8] = 4;                                  /* header paragraphs */
+    mz[0x3C] = 0x40;
+    fwrite(mz, 1, 0x40, f);
+    fwrite(nehdr, 1, hl, f);
+    /* non-resident names (paragraph in the .OVL) */
+    pos = ftell(f);
+    if (!fcopy(f, o, (long)rdw(nehdr + 0x2C) << 4, rdw(nehdr + 0x20)))
+        goto out;
+    wrw(nehdr + 0x2C, (unsigned)pos);
+    wrw(nehdr + 0x2E, 0);
+    for (i = 0; i < nseg; i++) {
+        unsigned char *t = nehdr + segtab + i * 8;
+        FILE *src;
+        off = rdw(t);
+        fl = rdw(t + 4);
+        if (!off)
+            continue;
+        src = (fl & NE_PRELOAD) ? b : o;
+        sz = rdw(t + 2) ? rdw(t + 2) : 0x10000L;
+        if (fl & NE_RELOCS)
+            sz += 2 + 8L * fgetw(src, ((long)off << 4) + sz);
+        pos = fpad(f);
+        if (!fcopy(f, src, (long)off << 4, sz))
+            goto out;
+        wrw(t, (unsigned)(pos >> 4));
+        if ((fl & NE_PRELOAD) && (fl & NE_DISCARD))
+            wrw(t + 6, rdw(t + 2));             /* the field held the .OVL copy */
+    }
+    if (resnam > restab + 2) {
+        if (rdw(nehdr + restab) != 4)
+            goto out;
+        q = restab + 2;
+        while (q + 8 <= resnam && rdw(nehdr + q)) {
+            unsigned cnt = rdw(nehdr + q + 2), j;
+            q += 8;
+            for (j = 0; j < cnt; j++, q += 12) {
+                unsigned char *t = nehdr + q;
+                FILE *src = (rdw(t + 4) & NE_PRELOAD) ? b : o;
+                pos = fpad(f);
+                if (!fcopy(f, src, (long)rdw(t) << 4, (long)rdw(t + 2) << 4))
+                    goto out;
+                wrw(t, (unsigned)(pos >> 4));
+                wrw(t + 8, 0);
+            }
+        }
+    }
+    wrw(nehdr + 0x32, 4);
+    nehdr[8] = nehdr[9] = 0;
+    fseek(f, 0x40, SEEK_SET);
+    fwrite(nehdr, 1, hl, f);
+    ok = !ferror(f);
+out:
+    if (b)
+        fclose(b);
+    if (o)
+        fclose(o);
+    if (f && fclose(f))
+        ok = 0;
+    if (!ok)
+        remove(outp);
+    return ok;
+}
+
+/* Windows 1.x/2.x: the MOUSE module of the files before INSTUSB is linked back */
+static void old_mouse_remove(const struct winst *w)
+{
+    char binp[PMAX], ovlp[PMAX], wub[PMAX], wuo[PMAX], tmp[PMAX], desc[80];
+    old_names(w, binp, ovlp, wub, wuo);
+    if (!exists(wub) || !exists(wuo))
+        return;
+    module_desc(binp, ovlp, "MOUSE", desc, sizeof(desc));
+    if (strstr(desc, "WINMOUSE")) {
+        join(tmp, w->dir, "WINUSB.$M$");
+        if (extract_module(wub, wuo, "MOUSE", tmp) && link_module(tmp, binp, ovlp, binp, ovlp, "MOUSE"))
+            printf("  %s: the mouse driver of Setup linked back\n", binp);
+        else
+            warn("cannot link the old mouse driver back into %s", binp);
+        remove(tmp);
+    }
+    if (del_file(wub) == 0 && del_file(wuo) == 0)
+        printf("  %s, %s deleted\n", wub, wuo);
+}
 
 static void sys_remove(TEXT *t, const char *win)
 {
@@ -2412,6 +3285,19 @@ static int inf_copy(const char *src, const char *dst)
 }
 
 #ifdef WIN_USB
+/* [386Enh] mouse= of Windows 95/98/ME ("*vmouse, msmouse.vxd"): Windows makes it "*vmd" while
+   WINUSB.VXD drives the PS/2 mouse; UNINUSB puts it back */
+static void vmouse_save(TEXT *t, const char *unused)
+{
+    char cur[VMAX];
+    (void)unused;
+    if (ini_find(t, "WINUSB", "Old386Mouse", NULL) >= 0 || ini_find(t, "386Enh", "mouse", cur) < 0)
+        return;
+    if (!strstr(strlwr(cur), "msmouse"))
+        return;
+    ini_set(t, "WINUSB", "Old386Mouse", cur);
+}
+
 static void ios_install(TEXT *t, const char *unused)
 {
     int h = ini_sec(t, "SafeList"), i;
@@ -2481,6 +3367,8 @@ static int w9x_install(const struct winst *w, const char *dir)
         printf("  %d of them are in use and get replaced at the next start of Windows (WININIT.INI)\n", later);
 #ifdef WIN_USB
     if (ini_edit(w->dir, "IOS.INI", ios_install, NULL))
+        return -1;
+    if (ini_edit(w->dir, "SYSTEM.INI", vmouse_save, NULL))
         return -1;
     if (ini_edit(w->dir, "SYSTEM.INI", sys_install, NULL))
         return -1;
@@ -2559,6 +3447,70 @@ static void drv9x_remove(TEXT *t, const char *unused)
 }
 #endif
 
+#ifdef WIN_USB
+/* [386Enh] mouse= back to Windows' PS/2 mouse driver (VMOUSE with MSMOUSE.VXD): Windows wrote
+   "*vmd" while WINUSB.VXD drove the mouse, and VMOUSE alone has no mouse */
+static void vmouse_remove(TEXT *t, const char *unused)
+{
+    char cur[VMAX], old[VMAX];
+    (void)unused;
+    if (ini_find(t, "WINUSB", "Old386Mouse", old) < 0 || !old[0])
+        strcpy(old, "*vmouse, msmouse.vxd");
+    if (ini_find(t, "386Enh", "mouse", cur) >= 0 && strstr(strlwr(cur), "msmouse"))
+        return;
+    ini_set(t, "386Enh", "mouse", old);
+    printf("  [386Enh] mouse=%s\n", old);
+}
+
+/* Windows' own driver back on the PS/2 mouse devnode that WINUSB.VXD took over (pnpusb.c):
+   in a DOS box the running VxD writes Windows' values back into the registry (V86 API
+   function 3), in MS-DOS mode the real-mode REGEDIT imports SYSTEM\WINUSBPS.REG, which the
+   VxD wrote with them */
+static void ps2_restore(const char *win)
+{
+    char reg[PMAX], ed[PMAX], sd[PMAX], ud[PMAX];
+    union REGS r;
+    struct SREGS s;
+    unsigned long ent;
+    unsigned res = 0;
+    sprintf(reg, "%s\\SYSTEM\\WINUSBPS.REG", win);
+    if (win9x_box) {
+        segread(&s);
+        s.es = 0;
+        r.x.ax = 0x1684;
+        r.x.bx = 0x3D34;            /* WINUSB.VXD */
+        r.x.di = 0;
+        int86x(0x2F, &r, &r, &s);
+        ent = ((unsigned long)s.es << 16) | r.x.di;
+        if (ent) {
+            _asm {
+                mov ax, 3
+                call dword ptr ent
+                mov res, ax
+            }
+        }
+        if (ent && res && res != 0xFFFF) {
+            printf("  PS/2 mouse: Windows' own driver restored in the registry\n");
+            del_file(reg);
+            return;
+        }
+    } else if (exists(reg)) {
+        sprintf(ed, "%s\\REGEDIT.EXE", win);
+        sprintf(sd, "/L:%s\\SYSTEM.DAT", win);
+        sprintf(ud, "/R:%s\\USER.DAT", win);
+        if (exists(ed) && spawnl(P_WAIT, ed, ed, sd, ud, reg, NULL) == 0) {
+            printf("  PS/2 mouse: Windows' own driver restored in the registry (REGEDIT %s)\n", reg);
+            del_file(reg);
+            return;
+        }
+    }
+    if (win9x_box && !ent)
+        return;                     /* WINUSB.VXD is not running: it never took the mouse */
+    warn("the PS/2 mouse may need Windows' driver again: Device Manager, Mouse, remove the\n"
+         "  \"WINUSB PS/2 Mouse\" and click Refresh (or run UNINUSB in a DOS box of Windows)%s", "");
+}
+#endif
+
 static int w9x_remove(const struct winst *w)
 {
     char f[PMAX];
@@ -2570,14 +3522,21 @@ static int w9x_remove(const struct winst *w)
     printf("  Remove the WINDRV devices in Device Manager first; the files go now.\n");
 #endif
 #ifdef WIN_USB
+    if (ini_edit(w->dir, "SYSTEM.INI", vmouse_remove, NULL))
+        return -1;
     if (ini_edit(w->dir, "SYSTEM.INI", sys_remove, (char *)w->dir))
         return -1;
+    ps2_restore(w->dir);
     if (ini_edit(w->dir, "WIN.INI", win_remove, NULL))
         return -1;
     ini_edit(w->dir, "IOS.INI", ios_remove, NULL);
 #endif
 #if defined(WIN_USB) || defined(WIN_AUDIO)
-    if (ini_edit(w->dir, "SYSTEM.INI", drv9x_remove, NULL))
+    /* WINSOUND.DRV stays the wave, MIDI and mixer driver while the other sound package is
+       installed */
+    if (w9x_other(w->dir, P_USB | P_AUD))
+        printf("  [drivers] wave=, midi= and mixer= stay for " OTHERSND "\n");
+    else if (ini_edit(w->dir, "SYSTEM.INI", drv9x_remove, NULL))
         return -1;
 #endif
 #ifndef WIN_UDF
@@ -3216,13 +4175,17 @@ static void usage(void)
            " [/NO32] [/DOS]"
 #endif
            " [/O options...]\n\n"
-           "  directory  where to install (default: the directory of the newest Windows)\n"
-           "  /W:windir  only this Windows (default: every supported Windows found)\n"
+           "  directory  where to install (default: the directory of the newest Windows chosen)\n"
+           "  /W:windir  only this Windows (default: setup lists the Windows installations\n"
+           "             it finds and asks which ones to set up)\n"
+           "  /ALL       every supported Windows found, without asking\n"
 #ifdef WIN_USB
            "  /NOWIN     do not set up WINMOUSE.DRV, WINWHEEL.EXE and WINSOUND.DRV\n"
            "  /NOSOUND   do not set up WINSOUND.DRV (USB Audio devices)\n"
 #elif defined(WIN_AUDIO)
            "  /NOWIN     do not set up WINSOUND.DRV and the MIDI Mapper\n"
+           "  /DOSONLY   only the DOS driver (Sound Blaster emulation in DOS and MS-DOS mode):\n"
+           "             Windows keeps its own driver for the sound card (WINAUDIO.SYS /NOVXD)\n"
 #elif defined(WIN_UDF)
            "  /NOWIN     do not set up WINUDF.VXD and the groups of Windows\n"
 #endif
@@ -3255,7 +4218,7 @@ int main(int argc, char **argv)
 {
     char src[PMAX], dir[PMAX] = "", win[PMAX] = "", opts[256] = "";
     char from[PMAX], to[PMAX], cfg[PMAX];
-    int i, useropts = 0, nowin = 0, same, copied = 0, inwin, pick;
+    int i, useropts = 0, nowin = 0, allwin = 0, same, copied = 0, inwin, pick;
 
     bootdrv = boot_drive();
     _harderr(critical_error);
@@ -3278,8 +4241,16 @@ int main(int argc, char **argv)
                 strip_slash(win);
             } else if (!stricmp(a + 1, "NOWIN") || !stricmp(a + 1, "NO32")) {
                 nowin = 1;
+            } else if (!stricmp(a + 1, "ALL")) {
+                allwin = 1;
             } else if (!stricmp(a + 1, "DOS")) {
                 dosdrv = 1;
+#ifdef WIN_AUDIO
+            } else if (!stricmp(a + 1, "DOSONLY")) {
+                dosdrv = 1;
+                nowin = 1;
+                dosonly = 1;
+#endif
 #ifdef WIN_USB
             } else if (!stricmp(a + 1, "NOSOUND")) {
                 no_sound = 1;
@@ -3295,6 +4266,17 @@ int main(int argc, char **argv)
             return 1;
         }
     }
+#ifdef WIN_AUDIO
+    /* the DOS driver lets go of the card when Windows starts and loads no VxD into it */
+    if (dosonly) {
+        if (!useropts) {
+            strcpy(opts, "/NOVXD");
+            useropts = 1;
+        } else if (!strstr(strupr(opts), "/NOVXD") && strlen(opts) + 8 < sizeof(opts)) {
+            strcat(opts, opts[0] ? " /NOVXD" : "/NOVXD");
+        }
+    }
+#endif
     if (windows_running()) {
         printf("Please exit Windows (or the task switcher) and run " INSTEXE " from DOS.\n");
         return 2;
@@ -3308,7 +4290,7 @@ int main(int argc, char **argv)
         }
     }
     if (!nowin) {
-        if (win_select(win, 1))
+        if (win_select(win, win[0] || allwin))
             return 1;
         if (!nwins && win[0]) {
             printf("No Windows installation supported by " PKG " was found in %s.\n", win);
@@ -3317,6 +4299,9 @@ int main(int argc, char **argv)
         if (!nwins) {
             /* plain DOS: the DOS driver alone */
             printf("No Windows installation found: the DOS driver only (/W:<windows directory> adds Windows).\n");
+            nowin = 1;
+        } else if (!win[0] && !allwin && !win_choose()) {
+            printf("No Windows chosen: the DOS driver only.\n");
             nowin = 1;
         }
     }
@@ -3418,7 +4403,7 @@ int main(int argc, char **argv)
 
 static void usage(void)
 {
-    printf("Usage: " UNINEXE " [/K] [/W:windir]\n\n"
+    printf("Usage: " UNINEXE " [/K] [/W:windir] [/REBOOT]\n\n"
            "  /K         keep the files, change only CONFIG.SYS"
 #ifdef WIN_USB
            ", SYSTEM.INI and WIN.INI\n"
@@ -3427,10 +4412,36 @@ static void usage(void)
 #else
            " and SYSTEM.INI\n"
 #endif
-           "  /W:windir  only this Windows (default: every supported Windows found)\n");
+           "  /W:windir  only this Windows (default: every supported Windows found)\n"
+           "  /REBOOT    restart the computer when done (the Uninstall item of Windows 3.x)\n");
 }
 
-int main(int argc, char **argv)
+static int reboot_after;
+
+/* a file Windows 95/98/ME has open (WINWHEEL.EXE runs): NUL=<file> in WININIT.INI of the
+   Windows the uninstaller runs in deletes it at the next start */
+static int del_later(const char *path)
+{
+    char ini[PMAX], *w = getenv("WINDIR");
+    FILE *fp;
+    if (!win9x_box || !w || strlen(w) + 13 > PMAX)
+        return -1;
+    sprintf(ini, "%s\\WININIT.INI", w);
+    fp = fopen(ini, "r+");
+    if (!fp) {
+        fp = fopen(ini, "w");
+        if (fp)
+            fputs("[rename]\r\n", fp);
+    } else {
+        fseek(fp, 0, SEEK_END);
+    }
+    if (!fp)
+        return -1;
+    fprintf(fp, "NUL=%s\r\n", path);
+    return fclose(fp) ? -1 : 0;
+}
+
+static int uninstall(int argc, char **argv)
 {
     char dir[PMAX] = "", own[PMAX], win[PMAX] = "", f[PMAX], cfg[PMAX];
     static const char *const syss[] = { "WINDISK.SYS", "WINUSB.SYS", "WINAUDIO.SYS", "WINUDF.EXE" };
@@ -3443,6 +4454,8 @@ int main(int argc, char **argv)
         char *a = argv[i];
         if ((a[0] == '/' || a[0] == '-') && !stricmp(a + 1, "K"))
             keep = 1;
+        else if ((a[0] == '/' || a[0] == '-') && !stricmp(a + 1, "REBOOT"))
+            reboot_after = 1;
         else if ((a[0] == '/' || a[0] == '-') && !strnicmp(a + 1, "W:", 2) && a[3] && strlen(a + 3) < PMAX) {
             strcpy(win, a + 3);
             strip_slash(win);
@@ -3479,8 +4492,12 @@ int main(int argc, char **argv)
         return 1;
 #endif
     for (i = 0; i < nwins; i++) {
-        if (wins[i].ver < WV_30)
+        if (wins[i].ver < WV_30) {
+#ifdef WIN_USB
+            old_mouse_remove(&wins[i]);
+#endif
             continue;
+        }
         printf("%s (%s)\n", wins[i].dir, win_name(&wins[i]));
         if (windows_remove(&wins[i]) || group_remove(&wins[i]))
             return 1;
@@ -3522,7 +4539,10 @@ int main(int argc, char **argv)
                 n++;
                 break;
             case -1:
-                warn("cannot delete %s", f);
+                if (del_later(f) == 0)
+                    printf("  %s is in use: deleted at the next start of Windows (WININIT.INI)\n", f);
+                else
+                    warn("cannot delete %s", f);
                 break;
             }
         }
@@ -3532,11 +4552,36 @@ int main(int argc, char **argv)
 #endif
         if (!inwin && rmdir(dir) == 0)
             printf("  %s removed\n", dir);
+        for (i = 0; i < nwins; i++)
+            if (IS9X(&wins[i]))
+                desktop_remove(&wins[i], dir);
     }
     flush_disks();
     printf("\n" PKG " is uninstalled%s.\n"
            "It stays in memory until the computer is restarted.\n",
            warnings ? " (see the warnings above)" : "");
+    return 0;
+}
+
+/* /REBOOT: Windows 3.x closed for the uninstaller (WINGRP /U) and would start again with
+   the driver still in memory; the computer restarts instead */
+int main(int argc, char **argv)
+{
+    void (__far *reset)(void) = (void (__far *)(void))MK_FP(0xFFFF, 0);
+    int r = uninstall(argc, argv);
+    if (!reboot_after)
+        return r;
+    if (r) {
+        printf("\nPress a key to return to Windows.\n");
+        getch();
+        return r;
+    }
+    printf("\nPress a key to restart the computer.\n");
+    getch();
+    flush_disks();
+    *(unsigned short __far *)MK_FP(0x40, 0x72) = 0x1234;    /* warm start */
+    outp(0x64, 0xFE);                                       /* keyboard controller reset */
+    reset();
     return 0;
 }
 #endif

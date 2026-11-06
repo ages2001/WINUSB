@@ -1,4 +1,4 @@
-; WINUSB.INF - WINDRV 1.1 WINUSB for Windows 95, 98 and ME: Universal Serial Bus controllers
+; WINUSB.INF - WINDRV 1.2 WINUSB for Windows 95, 98 and ME: Universal Serial Bus controllers
 ; UHCI (USB 1.1), OHCI (USB 1.1), EHCI (USB 2.0), xHCI (USB 3.x) and USB4 host controllers,
 ; USB hubs and the USB devices without a class driver of WINDRV. WINUSB.VXD drives the
 ; controllers and enumerates the devices; the other classes have their own INF files:
@@ -87,7 +87,7 @@ UpdateInis=WINUSB.Inis
 [WINUSB.HC.AddReg]
 HKR,,DevLoader,,WINUSB.VXD
 HKR,,Options,,""
-HKR,,DriverDesc,,"%Provider% WINUSB 1.1"
+HKR,,DriverDesc,,"%Provider% WINUSB 1.2"
 
 [WINUSB.CopyVxd]
 WINUSB.VXD
@@ -154,7 +154,7 @@ HKR,,NTMPDriver,,WINUSBW.SYS
 [Strings]
 Provider="WINDRV"
 ClassName="Universal Serial Bus controllers"
-DiskName="WINDRV WINUSB 1.1 disk"
+DiskName="WINDRV WINUSB 1.2 disk"
 UHCI.Desc="WINUSB USB 1.1 UHCI Universal Host Controller"
 OHCI.Desc="WINUSB USB 1.1 OHCI Open Host Controller"
 EHCI.Desc="WINUSB USB 2.0 EHCI Enhanced Host Controller"

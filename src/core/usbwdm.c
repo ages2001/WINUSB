@@ -87,6 +87,9 @@ static int wb_probe(struct usb_dev *d, u8 *iface, u8 *end)
     int i, slot = -1;
     (void)end;
     if (!usb_wdm_on || iface[5] == 9) return -1;
+    /* the other interfaces of a sound device WINUSB plays itself (its audio streaming and MIDI
+       interfaces): Windows' USB audio driver must not get them too */
+    if (iface[5] == 1 && (d->driver == UD_AUDIO || d->driver == UD_MIDI)) return -1;
     for (i = 0; i < MAXFN; i++) {
         if (!fns[i].used) { if (slot < 0) slot = i; continue; }
         if (fns[i].d == d && fns[i].iface == iface[2]) return 0;

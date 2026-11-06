@@ -114,6 +114,7 @@ extern u32 __cdecl cm_get_device_id(u32 dn, char *buf, u32 len, u32 flags);
 extern u32 __cdecl cm_create_devnode(u32 *pdn, const char *id, u32 parent, u32 flags);
 extern u32 __cdecl cm_remove_subtree(u32 dn, u32 flags);
 extern u32 __cdecl cm_register_device_driver(u32 dn, void *handler, u32 ref, u32 flags);
+extern void __cdecl mmdevldr_register(u32 dn, void *handler, u32 ref);   /* MMDEVLDR_Register_Device_Driver */
 extern u32 __cdecl cm_register_enumerator(u32 dn, void *handler, u32 flags);
 extern u32 __cdecl cm_call_at_appy_time(void *handler, u32 ref, u32 flags);
 extern u32 __cdecl cm_get_devnode_status(u32 *status, u32 *problem, u32 dn, u32 flags);

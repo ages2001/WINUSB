@@ -43,6 +43,8 @@ static int call_api(unsigned fn, unsigned long a0, unsigned long a1, unsigned lo
     return req.status;
 }
 
+static struct wincb __far *cbp;
+
 static int detect(unsigned char id)
 {
     union REGS r;
@@ -52,7 +54,9 @@ static int detect(unsigned char id)
     r.h.al = 0;
     r.x.bx = 0;
     int86x(0x2F, &r, &r, &sr);
-    return r.h.al == 0xFF && r.x.bx == 0x3357;
+    if (r.h.al != 0xFF || r.x.bx != 0x3357) return 0;
+    cbp = (struct wincb __far *)MK_FP(sr.es, r.x.di);
+    return 1;
 }
 
 static unsigned long ticks(void)
@@ -85,7 +89,8 @@ static void load_devs(void)
 
 static const char *tname(int t)
 {
-    return t == 1 ? "HD Audio" : t == 2 ? "AC'97" : t == 3 ? "USB Audio" : "?";
+    return t == 1 ? "HD Audio" : t == 2 ? "AC'97" : t == 3 ? "USB Audio" : t == 4 ? "AudioPCI" :
+           t == 5 ? "EMU10K1" : "?";
 }
 
 static void srcnames(unsigned s, char *out)
@@ -184,9 +189,9 @@ static void sb_show(void)
                    "   of the card coming late. Please report the machine.\n");
     }
     if (!(sb.flags & (SBF_VXD | SBF_V86 | SBF_DOSTRAP)))
-        printf("   DOS: not available - remove EMM386 (WINAUDIO.SYS traps the ports itself without\n"
-               "   it), or load QEMM, or JEMM386 / JEMMEX with QPIEMU.DLL before WINAUDIO.SYS.\n"
-               "   Windows MS-DOS boxes always have the emulation.\n");
+        printf("   DOS: not available - remove EMM386 (WINAUDIO.SYS then traps the ports itself\n"
+               "   and gives EMS, VCPI and DPMI), or load QEMM 7.03+, or JEMM386 / JEMMEX with\n"
+               "   QPIEMU.DLL before WINAUDIO.SYS. Windows MS-DOS boxes always have it.\n");
 }
 
 static volatile unsigned sbirqs;
@@ -647,6 +652,31 @@ static void mixer_show(int dev)
     }
 }
 
+/* the mixer settings the driver keeps, to <driver directory>\WINAUDIO.VOL (WINUSB.VOL):
+   the DOS driver sets them again at the next start (Windows keeps its own) */
+static void save_vols(void)
+{
+    static struct winvolrec recs[16];
+    char path[100];
+    int st, i, dir = 0;
+    FILE *f;
+    st = call_api(WINF_AUD_VOLS, 0, 0, 0, (void __far *)recs, sizeof(recs));
+    if (st || !req.retlen) return;
+    for (i = 0; i < 90 && cbp->vxdpath[i]; i++) {
+        path[i] = cbp->vxdpath[i];
+        if (path[i] == '\\' || path[i] == ':') dir = i + 1;
+    }
+    strcpy(path + dir, mplex == WIN_MPLEX_USB ? "WINUSB.VOL" : "WINAUDIO.VOL");
+    f = fopen(path, "wb");
+    if (!f) {
+        printf("AUDTEST: cannot write %s\n", path);
+        return;
+    }
+    fwrite(recs, 1, (unsigned)req.retlen, f);
+    fclose(f);
+    printf("Saved to %s (set again when the driver starts).\n", path);
+}
+
 static void mixer_set(int dev, const char *what, const char *val)
 {
     static const char *const srcs[] = { "MIC", "LINE", "CD", "AUX", "MIX" };
@@ -658,6 +688,7 @@ static void mixer_set(int dev, const char *what, const char *val)
         st = call_api(WINF_AUD_MIX, (unsigned long)dev, MX_SRC | 0x80000000UL, 1UL << i, NULL, 0);
         if (st) die("record source", st);
         if (req.retlen != (1UL << i)) printf("AUDTEST: the device has no %s input\n", srcs[i]);
+        save_vols();
         return;
     }
     for (i = 0; i < MX_COUNT && stricmp(what, mxname[i]); i++) ;
@@ -667,6 +698,7 @@ static void mixer_set(int dev, const char *what, const char *val)
     v = v * 65535UL / 100;
     st = call_api(WINF_AUD_MIX, (unsigned long)dev, (unsigned long)i | 0x80000000UL, v | (v << 16), NULL, 0);
     if (st) die("mixer", st);
+    save_vols();
 }
 
 static void showlog(void)
@@ -679,7 +711,7 @@ static void showlog(void)
 
 static void usage(void)
 {
-    printf("AUDTEST 1.1 - WINAUDIO test tool\n\n"
+    printf("AUDTEST 1.2 - WINAUDIO test tool\n\n"
            "  AUDTEST                      list sound devices\n"
            "  AUDTEST TONE [hz] [dev]      2-second test tone (left, then both channels)\n"
            "  AUDTEST PLAY file.wav [dev]  play a WAV file (PCM 8..32 bit, float, any rate)\n"
@@ -688,6 +720,7 @@ static void usage(void)
            "  AUDTEST MIX [dev]            show the mixer\n"
            "  AUDTEST MIX dev control 0..100   control: MASTER WAVE SYNTH INPUT CD LINE\n"
            "  AUDTEST MIX dev SRC MIC|LINE|CD|AUX|MIX  record source\n"
+           "                               (settings are kept in WINAUDIO.VOL for the next start)\n"
            "  AUDTEST SB                   test the Sound Blaster 16 emulation (DSP, IRQ, DMA, FM, MPU)\n"
            "  AUDTEST LOG                  driver log\n"
            "  /USB                         use the USB audio devices of WINUSB.SYS\n");

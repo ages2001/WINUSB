@@ -157,6 +157,7 @@ static void audio_start(void)
             /* Intel DSP (SST / SOF) functions keep HD Audio registers in BAR0 */
             if (d->vendor == 0x8086 && pci_bar_mem(d, 0, NULL) && !(cb->opts & OPT_NOHDA) && hda_probe(d) == 0)
                 continue;
+            if (d->sub == 1 && (es137x_probe(d) == 0 || emu10k_probe(d) == 0)) continue;
             if (d->sub == 1 && !(cb->opts & OPT_NOAC97)) ac97_probe(d);
         }
     }
@@ -181,7 +182,7 @@ static void audio_summary(void)
         kprintf(CORENAME ": %s\n", a->name);
         if (a->pcivid)
             kprintf(CORENAME ":   %s %04x:%04x at PCI %02x:%02x.%x, IRQ %d, %lu Hz\n",
-                    a->type == AT_HDA ? "HD Audio" : "AC'97", a->pcivid, a->pcidid, a->loc >> 8, (a->loc >> 3) & 31,
+                    a->type == AT_HDA ? "HD Audio" : a->type == AT_ENS ? "AudioPCI" : a->type == AT_EMU ? "EMU10K" : "AC'97", a->pcivid, a->pcidid, a->loc >> 8, (a->loc >> 3) & 31,
                     a->loc & 7, a->irq, a->out.rate);
     }
     {
@@ -313,7 +314,7 @@ int core_init(struct core_params *p)
     if (plat_mode == PM_DOS) blk_scan_fixed();
 #endif
 #ifdef WIN_DISK
-    if (plat_mode == PM_DOS && !cb->nfixed) {
+    if (plat_mode == PM_DOS && !cb->nfixed && !(cb->flags & CBF_QUIET)) {
         plat_screen(1);
         blk_explain(nide, nahci, nnvme);
         plat_screen((cb->opts & OPT_SCREEN) != 0);
@@ -449,6 +450,10 @@ int core_pnp_start(const u32 *bdfs, int n)
                 started++;
                 continue;
             }
+            if (d->sub == 1 && (es137x_probe(d) == 0 || emu10k_probe(d) == 0)) {
+                started++;
+                continue;
+            }
             if (d->sub == 1 && !(cb->opts & OPT_NOAC97) && ac97_probe(d) == 0) started++;
         }
     }
@@ -474,6 +479,8 @@ void core_pnp_stop(u32 bdf)
 #else
     hda_remove(bdf);
     ac97_remove(bdf);
+    es137x_remove(bdf);
+    emu10k_remove(bdf);
 #endif
 }
 
@@ -671,7 +678,7 @@ int core_api(struct winapireq *r)
 #endif
         in->poolfree = pool_free_bytes();
         in->uptime_ms = plat_ms() - start_ms;
-        strlcpy(in->build, "WINDRV 1.1 " __DATE__, sizeof(in->build));
+        strlcpy(in->build, "WINDRV 1.2 " __DATE__, sizeof(in->build));
         r->retlen = sizeof(*in);
         return WINE_OK;
     }
@@ -789,6 +796,7 @@ int core_api(struct winapireq *r)
     case WINF_AUD_CTL:
     case WINF_AUD_MIX:
     case WINF_AUD_MIDI:
+    case WINF_AUD_VOLS:
 #ifdef WIN_AUDIO
     case WINF_AUD_SB:
         if (r->fn == WINF_AUD_SB) {

@@ -111,6 +111,119 @@ static u32 __cdecl bios_disk_config(u32 func, u32 sub, u32 dn, u32 ref, u32 flag
     return ((cmhandler)p->cfgh)(func, sub, dn, p->cfgref, flags);
 }
 
+#ifdef WIN_DISK
+/* ---- other port drivers of the I/O Supervisor on hardware WINDISK drives ----
+   The detection of Windows (or an earlier driver) can leave devnodes that describe the same
+   hardware again: "Primary / Secondary IDE controller" (ESDI_506.PDR) at the compatibility
+   ports of a PCI IDE controller WINDISK now drives, an old SCSI miniport (AHCI, NVMe) entry.
+   Two drivers on one IDE channel take each other's interrupts and status: requests that
+   never end (Explorer hangs when it asks every drive at once), every drive twice in Device
+   Manager. Such a devnode is not started: its CONFIG_START fails (Device Manager shows it
+   with a problem), its drives stay with WINDISK. */
+#define MAXFOREIGN 24
+static struct { u32 dn, h, ref; } foreign[MAXFOREIGN];
+static int nforeign;
+
+static int overlaps(u32 a, u32 alen, u32 b, u32 blen)
+{
+    if (!alen) alen = 1;
+    if (!blen) blen = 1;
+    return a < b + blen && b < a + alen;
+}
+
+/* the ports [base, base + len) belong to a controller WINDISK drives */
+static int io_ours(u32 base, u32 len)
+{
+    int i, k;
+    for (k = 0; k < 8; k++)
+        if (cb && cb->ideown[k] && overlaps(base, len, cb->ideown[k], 8)) return 1;
+    for (i = 0; i < pnp_nnodes; i++) {
+        struct pnode *p = &pnp_nodes[i];
+        int bus, dev, fn, b;
+        u32 cls;
+        if (!p->dn || p->kind != PK_PCI) continue;
+        bus = (int)(p->bdf >> 8);
+        dev = (int)((p->bdf >> 3) & 0x1F);
+        fn = (int)(p->bdf & 7);
+        cls = pci_rd32(bus, dev, fn, 8) >> 8;
+        if ((cls >> 16) != 0x01) continue;
+        if ((cls >> 8) == 0x0101) {
+            if (!(cls & 1) && overlaps(base, len, 0x1F0, 8)) return 1;
+            if (!(cls & 4) && overlaps(base, len, 0x170, 8)) return 1;
+        }
+        for (b = 0; b < 6; b++) {
+            u32 bar = pci_rd32(bus, dev, fn, 0x10 + 4 * b);
+            if ((bar & 1) && (bar & 0xFFFC) && overlaps(base, len, bar & 0xFFFC, 1)) return 1;
+        }
+    }
+    return 0;
+}
+
+/* the memory [base, base + len) is a register window of a controller WINDISK drives */
+static int mem_ours(u32 base, u32 len)
+{
+    int i, b;
+    for (i = 0; i < pnp_nnodes; i++) {
+        struct pnode *p = &pnp_nodes[i];
+        int bus, dev, fn;
+        if (!p->dn || p->kind != PK_PCI) continue;
+        bus = (int)(p->bdf >> 8);
+        dev = (int)((p->bdf >> 3) & 0x1F);
+        fn = (int)(p->bdf & 7);
+        if ((pci_rd32(bus, dev, fn, 8) >> 24) != 0x01) continue;
+        for (b = 0; b < 6; b++) {
+            u32 bar = pci_rd32(bus, dev, fn, 0x10 + 4 * b);
+            if (!(bar & 1) && (bar & 0xFFFFFFF0UL) && overlaps(base, len, bar & 0xFFFFFFF0UL, 1)) return 1;
+            if ((bar & 7) == 4) b++;                    /* 64-bit BAR */
+        }
+    }
+    return 0;
+}
+
+static u32 __cdecl foreign_config(u32 func, u32 sub, u32 dn, u32 ref, u32 flags)
+{
+    int i;
+    (void)ref;
+    for (i = 0; i < nforeign && foreign[i].dn != dn; i++) ;
+    if (i == nforeign) return CR_DEFAULT;
+    if (func == CONFIG_START) {
+        struct cmconfig c;
+        int k, hit = 0;
+        memset(&c, 0, sizeof(c));
+        if (cm_get_alloc_log_conf(&c, dn, 0) == CR_SUCCESS) {
+            for (k = 0; k < c.nio && k < MAX_IO_PORTS && !hit; k++) hit = io_ours(c.iobase[k], c.iolen[k]);
+            for (k = 0; k < c.nmem && k < MAX_MEM_REGISTERS && !hit; k++) hit = mem_ours(c.membase[k], c.memlen[k]);
+        }
+        if (hit) {
+            kprintf("pnp: devnode %08lx: another port driver for a controller WINDISK drives, not started\n", dn);
+            return CR_FAILURE;
+        }
+    }
+    return ((cmhandler)foreign[i].h)(func, sub, dn, foreign[i].ref, flags);
+}
+
+/* a devnode of the I/O Supervisor that is not ours: its handler goes behind foreign_config */
+static void foreign_hook(u32 *a)
+{
+    char buf[16];
+    u32 len = sizeof(buf) - 1;
+    int i;
+    if (a[1] == (u32)foreign_config) return;
+    memset(buf, 0, sizeof(buf));
+    if (cm_read_registry_value(a[0], NULL, "DevLoader", REG_SZ, buf, &len, CM_REGISTRY_SOFTWARE) != CR_SUCCESS ||
+        (buf[0] != '*' || (buf[1] | 0x20) != 'i' || (buf[2] | 0x20) != 'o' || (buf[3] | 0x20) != 's' || buf[4]))
+        return;
+    for (i = 0; i < nforeign && foreign[i].dn != a[0]; i++) ;
+    if (i == MAXFOREIGN) return;
+    if (i == nforeign) nforeign++;
+    foreign[i].dn = a[0];
+    foreign[i].h = a[1];
+    foreign[i].ref = a[2];
+    a[1] = (u32)foreign_config;
+    a[2] = a[0];
+}
+#endif
+
 /* _CONFIGMG_Register_Device_Driver (vxdent.asm hook), a[] = devnode, handler, refdata, flags:
    for the disk of a BIOS drive the I/O Supervisor's handler goes behind bios_disk_config and
    the devnode is not removable (the Configuration Manager removes removable devnodes at
@@ -119,6 +232,12 @@ void __cdecl pnp_regdrv_hook(u32 *a)
 {
     struct pnode *p = pnp_node_by_dn(a[0]);
     int unit = bios_disk_node(p);
+#ifdef WIN_DISK
+    if (!p && a[1]) {
+        foreign_hook(a);
+        return;
+    }
+#endif
     if (!unit || a[1] == (u32)bios_disk_config) return;
     p->cfgh = a[1];
     p->cfgref = a[2];

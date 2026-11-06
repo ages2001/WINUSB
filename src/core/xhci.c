@@ -345,13 +345,15 @@ static void handle_event(struct xhci *x, struct trb *e, struct usb_xfer **done)
                 /* data stage event records the length, status stage completes */
                 if (xp->trb_len[k] && k == 1) {
                     t->actual = xp->trb_len[k] - resid;
-                    if (cc == 13 && k < xp->ntrb[s] - 1) return;
+                    if ((cc == 13 || resid) && k < xp->ntrb[s] - 1) return;
                 }
                 if (k == xp->ntrb[s] - 1) finish(x, xp, s, XS_OK, done);
                 return;
             }
             t->actual = before + xp->trb_len[k] - resid;
-            if (cc == 13 || k == xp->ntrb[s] - 1) finish(x, xp, s, XS_OK, done);
+            /* a short packet: Fresco Logic FL1000 / FL1100 report it as success with the
+               residual length (Linux XHCI_TRUST_TX_LENGTH); the TD ends there either way */
+            if (cc == 13 || resid || k == xp->ntrb[s] - 1) finish(x, xp, s, XS_OK, done);
             return;
         }
         if (cc == 26 || cc == 27) return;           /* stopped: cancel path handles it */

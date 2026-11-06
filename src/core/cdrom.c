@@ -111,6 +111,9 @@ static int cd_ready(struct cdrom *cd, int force)
     int i, r = -1;
     u32 now = plat_ms();
     if (!force && cd->media && now - cd->checked < 1000) return 0;
+    /* no medium: asked again within half a second (Windows asks every drive at once when a
+       folder opens, and the media check of the I/O Supervisor follows), the same answer */
+    if (!force && !cd->media && cd->checked && now - cd->checked < 500) return -2;
     cd->checked = now;
     memset(c, 0, sizeof(c));
     for (i = 0; i < 4; i++) {

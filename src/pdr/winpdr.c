@@ -412,7 +412,7 @@ static void aer_inquiry(struct aep_dcb *a)
         d->inquiry_flags[1] = 0x80;
         padcopy(d->vendor_id, PDR_VENDOR, 8);
         padcopy(d->product_id, info.model, 16);
-        padcopy(d->rev_level, "1.1", 4);
+        padcopy(d->rev_level, "1.2", 4);
         padcopy(d->port_name, PDR_VENDOR, 8);
         d->port_specific = info.handle;
         d->rsv2 = m >= 0 ? (u32)m : 0;  /* medium changes seen */
@@ -450,7 +450,7 @@ static void aer_inquiry(struct aep_dcb *a)
     d->inquiry_flags[1] = info.removable ? 0x80 : 0;
     padcopy(d->vendor_id, PDR_VENDOR, 8);
     padcopy(d->product_id, info.model, 16);
-    padcopy(d->rev_level, "1.1", 4);
+    padcopy(d->rev_level, "1.2", 4);
     padcopy(d->port_name, PDR_VENDOR, 8);
     d->port_specific = info.handle;
     a->hdr.result = AEP_SUCCESS;

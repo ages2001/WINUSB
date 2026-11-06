@@ -107,6 +107,62 @@ static void batch_schedule(void)
 }
 #endif
 
+#if defined(WIN_AUDIO) || defined(WIN_USB)
+/* ---- the saved mixer settings (struct winvolrec array, aeng.c) in the software key of the
+   first controller, value "Volumes": set before the sound devices start, written on every
+   change ---- */
+int aeng_api(struct winapireq *r, u8 *buf);
+
+static u32 vol_dn(void)
+{
+    int i;
+    for (i = 0; i < pnp_nnodes; i++)
+        if (pnp_nodes[i].dn && pnp_nodes[i].kind == PK_PCI) return pnp_nodes[i].dn;
+    return 0;
+}
+
+void pnp_vol_saved(const void *recs, u32 len)
+{
+    u32 dn = vol_dn();
+    if (dn) cm_write_registry_value(dn, NULL, "Volumes", REG_BINARY, recs, len, CM_REGISTRY_SOFTWARE);
+}
+
+#ifdef WIN_USB
+/* the pointer speed USBTREE set (WINF_SETOPT 5), value "MouseSpeed" next to "Volumes" */
+void pnp_mspeed_saved(u32 pct)
+{
+    u32 dn = vol_dn();
+    if (dn) cm_write_registry_value(dn, NULL, "MouseSpeed", REG_BINARY, &pct, 4, CM_REGISTRY_SOFTWARE);
+}
+
+static void mspeed_restore(void)
+{
+    u32 dn = vol_dn(), pct = 0, len = 4;
+    if (!dn || !cb || cm_read_registry_value(dn, NULL, "MouseSpeed", REG_BINARY, &pct, &len, CM_REGISTRY_SOFTWARE) != CR_SUCCESS ||
+        len != 4 || pct < 25 || pct > 400)
+        return;
+    ((struct windos *)((u8 *)cb + WIN_DOSOFF))->mspeed = (u8)(pct / 2);
+    kprintf("pnp: saved pointer speed %lu%%\n", pct);
+}
+#endif
+
+static void vol_restore(void)
+{
+    static u8 buf[16 * sizeof(struct winvolrec)];
+    static struct winapireq rq;
+    u32 dn = vol_dn(), len = sizeof(buf);
+    if (!dn || cm_read_registry_value(dn, NULL, "Volumes", REG_BINARY, buf, &len, CM_REGISTRY_SOFTWARE) != CR_SUCCESS ||
+        len < sizeof(struct winvolrec))
+        return;
+    memset(&rq, 0, sizeof(rq));
+    rq.fn = WINF_AUD_VOLS;
+    rq.arg0 = 1;
+    rq.buflen = len;
+    aeng_api(&rq, buf);
+    kprintf("pnp: saved mixer settings of %lu device(s)\n", len / (u32)sizeof(struct winvolrec));
+}
+#endif
+
 static void batch_run(void)
 {
     u32 bdfs[32];
@@ -115,6 +171,12 @@ static void batch_run(void)
     batch_due = 0;
     if (!vxd_core_up()) vxd_core_start_pnp();
     if (!vxd_core_up()) return;
+#if defined(WIN_AUDIO) || defined(WIN_USB)
+    vol_restore();
+#endif
+#ifdef WIN_USB
+    mspeed_restore();
+#endif
     for (i = 0; i < pnp_nnodes; i++) {
         struct pnode *p = &pnp_nodes[i];
         if (p->dn && p->kind == PK_PCI && p->started == 1 && n < 32) {
@@ -125,6 +187,9 @@ static void batch_run(void)
     if (!n) return;
     r = core_pnp_start(bdfs, n);
     kprintf("pnp: %d controller(s) started\n", r);
+#if defined(WIN_AUDIO) || defined(WIN_USB)
+    ds_schedule();
+#endif
 }
 
 void __cdecl vxd_pnpbatch(u32 vm, struct crs *c)
@@ -198,6 +263,9 @@ u32 __cdecl vxd_cmconfig(u32 func, u32 sub, u32 dn, u32 ref, u32 flags)
     case CONFIG_REMOVE:
         if (p->started == 2) {
             kprintf("pnp: stop %02lx:%02lx.%lu\n", p->bdf >> 8, (p->bdf >> 3) & 0x1F, p->bdf & 7);
+#if defined(WIN_AUDIO) || defined(WIN_USB)
+            ds_stop(p->bdf);
+#endif
             vmm_begin_crit();
             core_pnp_stop(p->bdf);
             vmm_end_crit();
@@ -210,6 +278,9 @@ u32 __cdecl vxd_cmconfig(u32 func, u32 sub, u32 dn, u32 ref, u32 flags)
         return CR_SUCCESS;
     case CONFIG_SHUTDOWN:
     case CONFIG_PRESHUTDOWN:
+#if defined(WIN_AUDIO) || defined(WIN_USB)
+        ds_stop(p->bdf);
+#endif
         return CR_SUCCESS;
     case CONFIG_APM:
         if (sub == CONFIG_APM_RESUME_SUSPEND || sub == CONFIG_APM_RESUME_CRITICAL) {
@@ -224,6 +295,9 @@ u32 __cdecl vxd_cmconfig(u32 func, u32 sub, u32 dn, u32 ref, u32 flags)
             }
 #else
             if (p->started == 2) {
+#if defined(WIN_AUDIO) || defined(WIN_USB)
+                ds_stop(p->bdf);
+#endif
                 vmm_begin_crit();
                 core_pnp_stop(p->bdf);
                 vmm_end_crit();
@@ -244,7 +318,6 @@ u32 pnp_new_devnode(u32 dn, u32 loadtype)
     struct pnode *p = pnp_node_by_dn(dn);
     char id[200];
     u32 r;
-    (void)loadtype;
     pnp_active = 1;
     memset(id, 0, sizeof(id));
     if (cm_get_device_id(dn, id, sizeof(id) - 1, 0) != CR_SUCCESS) id[0] = 0;
@@ -264,6 +337,18 @@ u32 pnp_new_devnode(u32 dn, u32 loadtype)
         p->bdf = bdf;
         strlcpy(p->id, id, sizeof(p->id));
     }
+    if (!p->registered && loadtype == DLVXD_LOAD_DRIVER) {
+        /* MMDEVLDR.VXD is the DevLoader (sound devices: MMSYSTEM then loads the wave driver
+           for this devnode) and loaded us as its driver: the configuration messages come
+           through it */
+        mmdevldr_register(dn, (void *)thk_cmconfig, 0);
+        p->registered = 1;
+        p->mm = 1;
+        if ((p->kind == PK_PCI || p->kind == PK_LEGACY) && pkg_enumerates()) {
+            r = cm_register_enumerator(dn, (void *)thk_cmenum, CM_REGISTER_ENUMERATOR_HARDWARE);
+            if (r != CR_SUCCESS) kprintf("pnp: CM_Register_Enumerator failed (%lx)\n", r);
+        }
+    }
     if (!p->registered) {
         r = cm_register_device_driver(dn, (void *)thk_cmconfig, 0,
                                       CM_REGISTER_DEVICE_DRIVER_DISABLEABLE | CM_REGISTER_DEVICE_DRIVER_REMOVABLE);
@@ -279,7 +364,7 @@ u32 pnp_new_devnode(u32 dn, u32 loadtype)
             if (r != CR_SUCCESS) kprintf("pnp: CM_Register_Enumerator failed (%lx)\n", r);
         }
     }
-    kprintf("pnp: devnode %08lx %s\n", dn, id);
+    kprintf("pnp: devnode %08lx %s%s\n", dn, id, p->mm ? " (MMDEVLDR)" : "");
     return CR_SUCCESS;
 }
 
@@ -333,10 +418,26 @@ struct pnode *pnp_child(struct pnode *parent, const char *id, const char *hwids,
 }
 
 /* all children against what the package sees now: new ones created, vanished ones removed */
+#ifdef WIN_USB
+/* what the child devnodes are now: when it changes, the DirectSound drivers follow */
+static u32 child_sig(void)
+{
+    u32 sig = 0;
+    int i;
+    for (i = 0; i < pnp_nnodes; i++)
+        if (pnp_nodes[i].dn && pnp_nodes[i].usbid) sig = (sig << 5 | sig >> 27) ^ pnp_nodes[i].dn ^ pnp_nodes[i].usbid;
+    return sig;
+}
+#endif
+
 static void pnp_sync(void)
 {
     int i;
     u32 r;
+#ifdef WIN_USB
+    static u32 lastsig;
+    u32 sig;
+#endif
     if (in_sync) return;        /* CM_Remove_SubTree / CM_Create_DevNode call the enumerator back */
     in_sync = 1;
     for (i = 0; i < pnp_nnodes; i++) pnp_nodes[i].seen = 0;
@@ -351,6 +452,13 @@ static void pnp_sync(void)
         r = cm_call_at_appy_time((void *)thk_appy, dn, 0);
         kprintf("pnp: %s gone, devnode %08lx removed (%lx)\n", p->id, dn, r);
     }
+#ifdef WIN_USB
+    sig = child_sig();
+    if (sig != lastsig) {
+        lastsig = sig;
+        ds_schedule();
+    }
+#endif
     in_sync = 0;
 }
 

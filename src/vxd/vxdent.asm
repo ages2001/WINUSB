@@ -51,7 +51,7 @@ WINCORE_DDB:
 %else
         dw 03D33h
 %endif
-        db 1, 1                 ; version 1.1
+        db 1, 2                 ; version 1.2
         dw 0                    ; flags
 %ifdef PKG_USB
         db 'WINUSB  '            ; name
@@ -265,6 +265,22 @@ _thk_int15:
         push ebp
         push ebx
         call _vxd_int15
+        add esp, 8
+        bt eax, 0
+        popad
+        ret
+%endif
+
+%ifdef PKG_AUDIO
+; V86 interrupt chain hook (INT 21h): a program of the Sound Blaster's machine ends
+extern _vxd_int21sb
+global _thk_int21sb
+_thk_int21sb:
+        pushad
+        cld
+        push ebp
+        push ebx
+        call _vxd_int21sb
         add esp, 8
         bt eax, 0
         popad
@@ -508,6 +524,24 @@ _vmm_page_alloc:
         add esp, 32
         mov ecx, [ebp+28]
         mov [ecx], edx
+        pop edi
+        pop esi
+        pop ebx
+        pop ebp
+        ret
+
+; void vmm_page_free(u32 handle): _PageFree
+global _vmm_page_free
+_vmm_page_free:
+        push ebp
+        mov ebp, esp
+        push ebx
+        push esi
+        push edi
+        push dword 0
+        push dword [ebp+8]
+        VMMCALL SVC__PageFree
+        add esp, 8
         pop edi
         pop esi
         pop ebx
@@ -790,6 +824,26 @@ REGWRAP _vmm_reg_close, 149h, 1
 REGWRAP _vmm_reg_enum, 14Ch, 4
 REGWRAP _vmm_reg_query, 151h, 6
 
+; void mmdevldr_register(u32 dn, void *handler, u32 ref): MMDEVLDR_Register_Device_Driver
+; (EAX devnode, EBX configuration handler, ECX reference data)
+global _mmdevldr_register
+_mmdevldr_register:
+        push ebp
+        mov ebp, esp
+        push ebx
+        push esi
+        push edi
+        mov eax, [ebp+8]
+        mov ebx, [ebp+12]
+        mov ecx, [ebp+16]
+        int 20h
+        dd 044A0000h
+        pop edi
+        pop esi
+        pop ebx
+        pop ebp
+        ret
+
 ; CM_Call_At_Appy_Time callback: C function with the reference data on the stack
 extern _vxd_appy
 global _thk_appy
@@ -809,6 +863,78 @@ _thk_appy:
         pop ebx
         pop ebp
         ret
+
+%ifdef PKG_USB
+%define DSHAL
+%elifdef PKG_AUDIO
+%define DSHAL
+%endif
+%ifdef DSHAL
+; ---- the DirectSound HAL (dsvxd.c) ----
+
+; u32 vxdldr_load(const char *name): VXDLDR_LoadDevice with initialization, the DDB or 0
+global _vxdldr_load
+_vxdldr_load:
+        push ebp
+        mov ebp, esp
+        push ebx
+        push esi
+        push edi
+        mov eax, 1                      ; VXDLDR_INIT_DEVICE
+        mov edx, [ebp+8]
+        int 20h
+        dd 00270001h                    ; VXDLDR_LoadDevice
+        jnc .ok
+        xor eax, eax
+.ok:    pop edi
+        pop esi
+        pop ebx
+        pop ebp
+        ret
+
+; u32 dsound_register(void *drv, u32 flags), dsound_deregister: DSOUND.VXD services (C convention)
+%macro DSWRAP 2
+global %1
+%1:
+        push ebp
+        mov ebp, esp
+        push ebx
+        push esi
+        push edi
+        push dword [ebp+12]
+        push dword [ebp+8]
+        int 20h
+        dd 357E0000h | %2
+        add esp, 8
+        pop edi
+        pop esi
+        pop ebx
+        pop ebp
+        ret
+%endmacro
+DSWRAP _dsound_register, 1
+DSWRAP _dsound_deregister, 2
+
+; CM_Call_At_Appy_Time callback of the registration
+extern _vxd_dsappy
+global _thk_dsappy
+_thk_dsappy:
+        push ebp
+        mov ebp, esp
+        push ebx
+        push esi
+        push edi
+        cld
+        push dword [ebp+8]
+        call _vxd_dsappy
+        add esp, 4
+        xor eax, eax
+        pop edi
+        pop esi
+        pop ebx
+        pop ebp
+        ret
+%endif
 
 ; CONFIGMG calls the enumerator handler as a C function
 extern _vxd_cmenum

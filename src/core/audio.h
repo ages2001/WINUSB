@@ -36,7 +36,10 @@ struct ahw {                    /* one direction: hardware ring, 16-bit stereo *
     u32 late;                   /* times the device played data we had not written yet */
     u32 zeroed;                 /* out: silence written up to here (total), ahead of fill */
     u32 latms;                  /* out: how far ahead to mix (ms), 0: the default of the platform */
+    u32 adapt;                  /* out: ms added to the default after the device ran dry */
 };
+
+#define MAXADEV     8           /* sound devices of the engine */
 
 struct adev {
     struct adevops *ops;
@@ -58,11 +61,15 @@ struct adev {
     u16 pcivid, pcidid;         /* the controller */
     u16 loc;                    /* PCI bus << 8 | device << 3 | function, 0xFFFF none */
     u8 hidden;                  /* internal (the sound bridge to WINUSB): not listed to Windows */
+    u8 cad1;                    /* HD Audio: codec address + 1 (its devnode in Windows 95/98/ME), 0 other */
+    u16 usbid;                  /* USB: the device id (its devnode in Windows 95/98/ME), 0 other */
 };
 
 #define AT_HDA  1
 #define AT_AC97 2
 #define AT_USB  3
+#define AT_ENS  4               /* Ensoniq AudioPCI family */
+#define AT_EMU  5               /* Creative EMU10K1 / EMU10K2 */
 
 /* the functions behind a controller for the Plug and Play enumerator of Windows 95/98/ME:
    HD Audio codec function groups, the devices of an Intel audio DSP */
@@ -105,6 +112,20 @@ void aeng_rt_rate(int id, u32 rate);
 void aeng_rt_vol(int id, u32 vl, u32 vr);
 u32 aeng_att_cdb(u32 v);                /* volume 0..65535 (linear amplitude) -> attenuation, 1/100 dB */
 void aeng_rt_close(int id);
+/* DirectSound buffers */
+int aeng_ds_open(int dev, struct winring *r, u8 *data, u32 rate, u32 bits, u32 ch, int secondary);
+int aeng_ds_format(int id, u32 rate, u32 bits, u32 ch);
+int aeng_ds_free(void);
+void aeng_ds_run(int id, int run);      /* primary */
+void aeng_ds_play(int id, int loop);    /* secondary */
+void aeng_ds_stop(int id);
+void aeng_ds_setpos(int id, u32 off);
+void aeng_ds_rate(int id, u32 rate);
+void aeng_ds_vol(int id, u32 vl, u32 vr);
+void aeng_ds_pos(int id, u32 *play, u32 *write);
+void aeng_ds_close(int id);
+u32 aeng_ds_loc(int dev);
+#define DSLOC_USB   0x80000000UL
 void aeng_midi(const u8 *m, int len);   /* to the synthesizer on the default device */
 void aeng_lowlat(int on);               /* DOS: serviced at the RTC rate */
 void aeng_tick(void);
@@ -123,6 +144,15 @@ int hda_probe(struct pcidev *p);
 int ac97_probe(struct pcidev *p);
 void hda_remove(u32 bdf);       /* controller taken away (Plug and Play stop) */
 void ac97_remove(u32 bdf);
+struct ac97;
+struct ac97 *ac97_ext(void *ctx, u16 (*rd)(void *ctx, int reg), void (*wr)(void *ctx, int reg, u16 v));
+void ac97_ext_vol(struct ac97 *c, int ctl, u32 lr);
+void ac97_ext_src(struct ac97 *c, int src);
+u32 ac97_ext_id(struct ac97 *c, int *vra);
+int es137x_probe(struct pcidev *p);     /* Ensoniq AudioPCI ES1370, ES1371 / ES1373, CT5880, EV1938 */
+void es137x_remove(u32 bdf);
+int emu10k_probe(struct pcidev *p);     /* Creative EMU10K1 / EMU10K2: Sound Blaster Live!, Audigy */
+void emu10k_remove(u32 bdf);
 void aeng_remove(struct adev *a);   /* stop, shut down and unregister a device */
 
 #endif

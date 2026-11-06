@@ -1,6 +1,8 @@
-; WINUSBA.INF - WINDRV 1.1 WINUSB for Windows 95, 98 and ME: Sound, video and game controllers
+; WINUSBA.INF - WINDRV 1.2 WINUSB for Windows 95, 98 and ME: Sound, video and game controllers
 ; USB Audio Class 1.0 and 2.0 devices and USB MIDI devices; WINSOUND.DRV (installed with the
-; controller) plays and records through them.
+; controller) plays and records through them. MMDEVLDR.VXD is the DevLoader: MMSYSTEM loads
+; WINSOUND.DRV for each device when it is plugged in, and DirectSound finds the DirectSound
+; driver of WINUSB.VXD for it.
 
 [Version]
 Signature="$CHICAGO$"
@@ -24,12 +26,24 @@ DefaultDestDir=11
 AddReg=WINUSB.Dev.AddReg
 
 [WINUSB.Dev.AddReg]
-HKR,,DevLoader,,WINUSB.VXD
+HKR,,DevLoader,,mmdevldr.vxd
+HKR,,Driver,,WINUSB.VXD
+HKR,Drivers,MIGRATED,,0
+HKR,Drivers,SubClasses,,"wave,midi,mixer"
+HKR,Drivers\wave\winsound.drv,Driver,,winsound.drv
+HKR,Drivers\wave\winsound.drv,Description,,%Wave.Desc%
+HKR,Drivers\midi\winsound.drv,Driver,,winsound.drv
+HKR,Drivers\midi\winsound.drv,Description,,%Midi.Desc%
+HKR,Drivers\mixer\winsound.drv,Driver,,winsound.drv
+HKR,Drivers\mixer\winsound.drv,Description,,%Mixer.Desc%
 
 [Strings]
 Provider="WINDRV"
-DiskName="WINDRV WINUSB 1.1 disk"
+DiskName="WINDRV WINUSB 1.2 disk"
 UAC2.Desc="WINUSB USB Audio Class 2.0 Device"
 UAC1.Desc="WINUSB USB Audio Class 1.0 Device"
 MIDI.Desc="WINUSB USB MIDI Device"
 Audio.Desc="WINUSB USB Audio Device"
+Wave.Desc="WINUSB USB Audio wave"
+Midi.Desc="WINUSB USB MIDI"
+Mixer.Desc="WINUSB USB Audio mixer"

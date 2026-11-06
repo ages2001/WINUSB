@@ -53,6 +53,45 @@ static struct wincb __far *detect(unsigned char id)
     return MK_FP(sr.es, r.x.di);
 }
 
+/* 1 if a block device driver with this name (7 characters after the unit count) is in the
+   DOS device chain */
+static int in_chain(const char *name)
+{
+    union REGS r;
+    struct SREGS sr;
+    unsigned char __far *h;
+    unsigned n;
+    segread(&sr);
+    r.h.ah = 0x52;
+    int86x(0x21, &r, &r, &sr);
+    h = (unsigned char __far *)MK_FP(sr.es, r.x.bx + 0x22);   /* the NUL device */
+    for (n = 0; n < 256; n++) {
+        if (!(*(unsigned __far *)(h + 4) & 0x8000) && !_fmemcmp(h + 11, name, 7)) return 1;
+        if (*(unsigned __far *)h == 0xFFFF) break;
+        h = (unsigned char __far *)MK_FP(*(unsigned __far *)(h + 2), *(unsigned __far *)h);
+    }
+    return 0;
+}
+
+/* The driver answers on INT 2Fh. When a program put back an INT 2Fh vector it had saved
+   before the driver hooked it (a driver loaded with DEVLOAD), the driver hooks it again
+   within a few seconds: wait for that when its device header is there. */
+static void detect_all(void)
+{
+    static const char *const hdr[2] = { "WINDISK", "WINUSB " };
+    unsigned long __far *ticks = (unsigned long __far *)MK_FP(0x40, 0x6C);
+    unsigned long t0 = *ticks;
+    int k, wait;
+    for (;;) {
+        wait = 0;
+        for (k = 0; k < 2; k++) {
+            if (!cbs[k]) cbs[k] = detect(mplexes[k]);
+            if (!cbs[k] && in_chain(hdr[k])) wait = 1;
+        }
+        if (!wait || *ticks - t0 > 110) break;      /* 6 seconds */
+    }
+}
+
 /* make driver k (0 disk, 1 USB) the target of call_api */
 static int use(int k)
 {
@@ -361,14 +400,13 @@ int main(int argc, char **argv)
     struct sbuf s;
     int i;
     unsigned seg;
-    printf("WININFO 1.1 - WINDRV status\n");
+    printf("WININFO 1.2 - WINDRV status\n");
     if (_dos_allocmem(BIGSZ / 16, &seg)) {
         printf("not enough memory\n");
         return 1;
     }
     big = MK_FP(seg, 0);
-    cbs[0] = detect(WIN_MPLEX_DISK);
-    cbs[1] = detect(WIN_MPLEX_USB);
+    detect_all();
     if (!cbs[0] && !cbs[1]) {
         printf("Neither WINDISK.SYS nor WINUSB.SYS is loaded.\n");
         return 1;

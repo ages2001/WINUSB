@@ -13,6 +13,11 @@
 #define PK_INPUT    5           /* PS/2 keyboard or mouse of another enumerator, no children */
 
 #define MAXNODE 64
+
+/* dsvxd.c (WINAUDIO, WINUSB): the DirectSound HAL */
+void ds_schedule(void);                 /* register the drivers of the devices at appy time */
+void ds_stop(u32 bdf);                  /* deregister those of a controller (0xFFFFFFFF all) */
+int ds_api_devnode(struct winapireq *r);
 struct pnode {
     u32 dn;
     u32 parent;                 /* devnode of the parent (children) */
@@ -23,7 +28,8 @@ struct pnode {
     u32 laststatus;
     u32 key;                    /* package key of a child (codec address, disk ...) */
     u8 state;                   /* package state of a child (last name written ...) */
-    u8 rsv[3];
+    u8 mm;                      /* loaded by MMDEVLDR.VXD (DevLoader): its wave driver is a PnP one */
+    u8 rsv[2];
     u32 cfgh, cfgref;           /* PK_IOSDISK of a BIOS drive: the I/O Supervisor's handler */
     char id[96];
 };
@@ -32,6 +38,13 @@ extern int pnp_nnodes;
 
 struct pnode *pnp_node_by_dn(u32 dn);
 struct pnode *pnp_node_by_bdf(u32 bdf);                 /* started or not, PK_PCI */
+#ifdef WIN_USB
+struct pnode *pnp_node_by_usbid(u16 id);                /* pnpusb.c: the devnode of a USB device */
+void pnp_ps2_regfile(void);                             /* pnpusb.c: SYSTEM\WINUSBPS.REG */
+int pnp_ps2_restore(void);                              /* pnpusb.c: Windows' PS/2 mouse driver back */
+extern const char * __cdecl vmm_exec_path(u32 *dirlen);
+extern u32 __cdecl ifs_r0io(u32 func, u32 rbx, u32 rcx, u32 rdx, void *rsi, u32 *err);
+#endif
 struct pnode *pnp_node_alloc(void);
 u32 pnp_hexval(const char *s, int n);
 const char *pnp_findstr(const char *s, const char *key);

@@ -6,7 +6,7 @@
 #pragma pack(push, 1)
 
 #define WIN_MAGIC        0x42433357UL    /* 'WINCB' */
-#define WIN_VERSION      0x0110
+#define WIN_VERSION      0x0120
 #define WIN_MAXUNITS     24
 #define WIN_KQLEN        20
 #define WIN_MPLEX_DISK   0xD3            /* INT 2Fh multiplex id of WINDISK.SYS */
@@ -75,6 +75,8 @@ struct winunit {                 /* 64 bytes */
 #define CBF_HAVEDISK    0x2000  /* WINDISK found disks: stays resident even without drive letters */
 #define CBF_CHARDEV     0x4000  /* WINDISK.SYS resident as a character device (no drive letters) */
 #define CBF_FWREQ       0x8000  /* WINAUDIO: the core asks for firmware files (wincb fw table) */
+#define CBF_QUIET       0x00010000UL    /* /Q: only error messages on the screen at the start */
+#define CBF_WINSTD      0x00020000UL    /* Windows standard mode runs (INT 2Fh 1605h / 1606h, DX bit 0) */
 
 /* WINAUDIO: firmware files of the Intel audio DSP, loaded into XMS by WINAUDIO.SYS from its
    directory before the core starts the sound devices; the table takes the place of the
@@ -240,6 +242,7 @@ struct wincbx {
 struct windos {
     unsigned long  lol;         /* 0  DOS List of Lists (INT 21h AH=52h), seg:off */
     unsigned char  hide;        /* 4  WINUSB: Windows 95/98/ME runs, every DOS drive of the units is hidden */
+    unsigned char  mspeed;      /* 5  WINUSB /SPEED:n: pointer speed of the mice and touchpads, n / 2 percent (0: 100) */
 };
 
 /* Sound Blaster 16 emulation (WINAUDIO): settings and the state the real-mode code of
@@ -270,6 +273,7 @@ struct winsb {
     unsigned short irqs;        /* 46 interrupts raised */
     unsigned long  tticks;      /* 48 DOS: RTC ticks */
     char           spec[24];    /* 52 /SB:A220,I5,D1,H5,P330 as given */
+    unsigned char  xflags;      /* 76 SBX_* */
 };
 #define SBF_ON          0x01    /* emulation runs */
 #define SBF_NOOPL       0x02    /* no FM synthesizer ports */
@@ -279,6 +283,9 @@ struct winsb {
 #define SBF_VXD         0x20    /* Windows: the VxD emulates it in MS-DOS boxes */
 #define SBF_V86         0x40    /* DOS: the built-in V86 monitor of WINAUDIO.SYS traps the ports */
 #define SBF_OFF         0x80    /* /NOSB */
+#define SBX_NOMODE      0x01    /* DOS: the DMA mode and mask registers stay with QEMM's DMA
+                                   translation (not trapped): the card's channel is taken as
+                                   auto-init and unmasked */
 
 /* Sound bridge between WINAUDIO and WINUSB, at this offset from the control block of both:
    the Sound Blaster emulation and the synthesizer of WINAUDIO play on a USB Audio device of
@@ -333,7 +340,7 @@ struct winvm {
     unsigned short vcpis;       /* 54 VCPI mode switches */
     unsigned short o_rmtgt;     /* 56 real-mode exit: far pointer to the real-mode part */
     unsigned char  pmode;       /* 58 a DPMI client is active */
-    unsigned char  rsv;         /* 59 */
+    unsigned char  ems_mb;      /* 59 /EMS:n: expanded memory offered, MB (0: 16) */
     unsigned short o_vmon;      /* 60 vm_on (byte): core calls go through the monitor */
     unsigned short rsv2;        /* 62 */
 };
@@ -348,6 +355,8 @@ struct winvm {
 #define VMF_WINSTD      0x0100  /* Windows standard mode runs (it needs VCPI) */
 #define VMF_VCPI        0x0200  /* /VCPI: VCPI for every program (else only without DPMI) */
 #define VMF_USEVME      0x0400  /* /VME: use the virtual-8086 mode extensions (faster INT n) */
+#define VMF_NOEMS       0x0800  /* /NOEMS: no expanded memory from the monitor */
+#define VMF_EMS         0x1000  /* the monitor offers expanded memory (EMMXXXX0) */
 /* VCPI gateway data in WINAUDIO.SYS (offsets from o_gw) */
 #define VMGW_CR3        0
 #define VMGW_CR4        4
@@ -394,7 +403,8 @@ struct core_params {
 #define WINF_BIOSMAP     0x0025  /* buf: winbiosmap: the BIOS disks on controllers the driver took */
 #define WINF_UNITS       0x0022  /* buf: winunit array (nunits entries), first drive in wininfo */
 #define WINF_LOG         0x0030
-#define WINF_SETOPT      0x0040
+#define WINF_SETOPT      0x0040  /* arg0 4: debug level arg1; 5: pointer speed arg1 percent (25..400,
+                                   0xFFFFFFFF only asks) -> retlen percent */
 #define WINF_FLUSH       0x0041
 
 #define WINF_AUD_DEVS    0x0050  /* buf: winauddev array */
@@ -404,6 +414,10 @@ struct core_params {
 #define WINF_AUD_MIX     0x0053  /* arg0 dev, arg1 MX_* (| 0x80000000 set), arg2 value -> retlen value */
 #define WINF_AUD_SB      0x0055  /* buf: winsb (Sound Blaster emulation settings and state) */
 #define WINF_AUD_MIDI    0x0054  /* arg0 dev (0xFF synthesizer), arg1 short message or buf/buflen */
+#define WINF_AUD_VOLS    0x0056  /* the saved mixer settings: arg0 0 get (buf: winvolrec array, retlen
+                                   bytes), 1 set (buf/buflen: winvolrec array, kept and applied) */
+#define WINF_AUD_DSNODE  0x0057  /* Windows 95/98/ME: arg0 dev -> retlen devnode of its DirectSound
+                                   driver (WINSOUND.DRV: DRV_QUERYDEVNODE) */
 
 /* USB video class cameras (WINUSB) */
 #define WINF_CAM_DEVS    0x0060  /* buf: wincamdev array */
@@ -475,6 +489,16 @@ struct winring {                 /* 32-byte header + data, in conventional memor
 #define MX_COUNT        6
 #define MX_SRC          0x100   /* WINF_AUD_MIX: input source (AS_*) */
 #define MX_MUTE         0x101   /* WINF_AUD_MIX: master mute */
+
+/* mixer settings of one device, kept by the driver (WINF_AUD_VOLS): Windows 95/98/ME keep them
+   in the registry, DOS in WINAUDIO.VOL (AUDTEST MIX writes it, WINAUDIO.SYS loads it) */
+struct winvolrec {
+    unsigned long  key;         /* CRC of the device name, USB / PCI ids */
+    unsigned long  vol[6];      /* MX_MASTER .. MX_LINE */
+    unsigned char  insrc;       /* recording source (AS_*), 0 none */
+    unsigned char  mute;
+    unsigned char  rsv[2];
+};
 
 #define AC_START        1       /* WINF_AUD_CTL */
 #define AC_PAUSE        2

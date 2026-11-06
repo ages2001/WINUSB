@@ -7,7 +7,10 @@
    WINGRP sends [CreateGroup()] and [AddItem()] to Program Manager over DDE (Windows 3.0
    and 3.1; the shell of Windows 95/98/ME answers the same commands with a Start Menu
    group), then removes the request and itself from WIN.INI. An item of the same name is
-   deleted first, so that installing again does not make duplicates. */
+   deleted first, so that installing again does not make duplicates.
+   "WINGRP /U WINUSB C:\WINDRV\UNINUSB.EXE" is the uninstall item of a group (Windows 3.x):
+   the uninstaller is a DOS program, so Windows closes and runs it (ExitWindowsExec); it
+   restarts the computer when it is done. */
 #include <windows.h>
 #include <dde.h>
 #include <string.h>
@@ -153,6 +156,81 @@ static void unrun(void)
     WriteProfileString("windows", "run", out);
 }
 
+/* Windows 95/98/ME: the desktop shortcuts the installer wrote in plain DOS have 8.3 names;
+   [WinDrv] Links.WINUSB=USBTREE.LNK|USB Devices;... gives them their long names */
+int lfn_rename(char __far *from, char __far *to);
+#pragma aux lfn_rename = \
+    "push ds" \
+    "mov ds, cx" \
+    "mov ax, 7156h" \
+    "stc" \
+    "int 21h" \
+    "sbb ax, ax" \
+    "pop ds" \
+    parm [cx dx] [es di] value [ax] modify [ax];
+
+static void links(const char *spec)
+{
+    char dir[160], from[192], to[192], sh[16], lng[64];
+    const char *p = spec;
+    int n;
+    n = GetWindowsDirectory(dir, sizeof(dir) - 10);
+    if (!n || n >= (int)sizeof(dir) - 10)
+        return;
+    if (dir[n - 1] != '\\')
+        lstrcat(dir, "\\");
+    lstrcat(dir, "DESKTOP\\");
+    while (*p) {
+        p = field(p, sh, sizeof(sh), '|');
+        p = field(p, lng, sizeof(lng), ';');
+        if (!sh[0] || !lng[0])
+            continue;
+        lstrcpy(from, dir);
+        lstrcat(from, sh);
+        lstrcpy(to, dir);
+        lstrcat(to, lng);
+        lstrcat(to, ".lnk");
+        lfn_rename(from, to);
+    }
+}
+
+typedef BOOL (FAR PASCAL *EWEPROC)(LPCSTR, LPCSTR);
+
+/* /U package uninstaller */
+static void uninstall(LPSTR cl)
+{
+    char pkg[16], exe[128], msg[400];
+    EWEPROC ewe;
+    int n;
+    while (*cl == ' ')
+        cl++;
+    for (n = 0; *cl && *cl != ' ' && n < (int)sizeof(pkg) - 1; n++)
+        pkg[n] = *cl++;
+    pkg[n] = 0;
+    while (*cl == ' ')
+        cl++;
+    for (n = 0; *cl && n < (int)sizeof(exe) - 1; n++)
+        exe[n] = *cl++;
+    exe[n] = 0;
+    if (!pkg[0] || !exe[0])
+        return;
+    wsprintf(msg, "Remove %s from this computer?\n\n"
+             "Windows closes and the uninstaller %s runs in DOS. When it is done, it restarts "
+             "the computer.\n\nSave your work in the other programs first.", (LPSTR)pkg, (LPSTR)exe);
+    if (MessageBox(NULL, msg, "Uninstall", MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
+        return;
+    /* ExitWindowsExec: Windows 3.1 and later */
+    ewe = (EWEPROC)GetProcAddress(GetModuleHandle("USER"), "ExitWindowsExec");
+    if (ewe) {
+        ewe(exe, "/REBOOT");
+        MessageBox(NULL, "A program did not let Windows close.", "Uninstall", MB_OK | MB_ICONSTOP);
+        return;
+    }
+    wsprintf(msg, "Windows now closes. Then run %s at the DOS prompt.", (LPSTR)exe);
+    if (MessageBox(NULL, msg, "Uninstall", MB_OKCANCEL | MB_ICONINFORMATION) == IDOK)
+        ExitWindows(0, 0);
+}
+
 int PASCAL WinMain(HANDLE hi, HANDLE hp, LPSTR cl, int show)
 {
     WNDCLASS wc;
@@ -160,8 +238,11 @@ int PASCAL WinMain(HANDLE hi, HANDLE hp, LPSTR cl, int show)
     ATOM app, topic;
     DWORD t0, t1;
     char *k;
-    (void)cl;
     (void)show;
+    if ((cl[0] == '/' || cl[0] == '-') && (cl[1] == 'U' || cl[1] == 'u') && cl[2] == ' ') {
+        uninstall(cl + 3);
+        return 0;
+    }
     if (!hp) {
         memset(&wc, 0, sizeof(wc));
         wc.lpfnWndProc = GrpWndProc;
@@ -190,6 +271,12 @@ int PASCAL WinMain(HANDLE hi, HANDLE hp, LPSTR cl, int show)
                     pump();
         }
         for (k = keys; *k; k += lstrlen(k) + 1) {
+            if (!strnicmp(k, "Links.", 6)) {
+                GetProfileString(SEC, k, "", val, sizeof(val));
+                links(val);
+                WriteProfileString(SEC, k, NULL);
+                continue;
+            }
             if (strnicmp(k, "Group.", 6))
                 continue;
             GetProfileString(SEC, k, "", val, sizeof(val));

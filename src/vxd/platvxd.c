@@ -30,6 +30,9 @@ extern void __cdecl thk_v86api(void);
 extern u32 vxd_refdata;
 
 void core_resume(void);
+#if defined(WIN_AUDIO) || defined(WIN_USB)
+int ds_api_devnode(struct winapireq *r);       /* dsvxd.c */
+#endif
 
 static u32 cb_far;              /* real-mode seg:off of the control block */
 static u32 sysvm, cur_high;
@@ -65,6 +68,31 @@ static int nirq;
 void plat_screen(int on)
 {
     (void)on;
+}
+
+void pnp_vol_saved(const void *recs, u32 len);
+void pnp_mspeed_saved(u32 pct);
+int pnp_ps2_restore(void);
+void pnp_ps2_regfile(void);
+
+/* Windows 95/98/ME: the registry (pnp.c), set again when the controllers start */
+void plat_mspeed_saved(u32 pct)
+{
+#ifdef WIN_USB
+    if (pnp_active) pnp_mspeed_saved(pct);
+#else
+    (void)pct;
+#endif
+}
+
+/* Windows 95/98/ME: the registry (pnp.c); Windows 3.x: WINSOUND.DRV keeps them in SYSTEM.INI */
+void plat_vol_saved(const void *recs, u32 len)
+{
+#if defined(WIN_AUDIO) || defined(WIN_USB)
+    if (pnp_active) pnp_vol_saved(recs, len);
+#else
+    (void)recs; (void)len;
+#endif
 }
 
 void plat_putc(char c)
@@ -203,6 +231,7 @@ static void mouse_event(int dx, int dy, int dz, int dw)
 void plat_mouse(int dx, int dy, int dz, int dw, int buttons)
 {
     u32 f = irq_save();
+    mouse_speed(&dx, &dy);
     m_usb_buttons = (u32)buttons & 0x1F;
     mouse_event(dx, dy, dz, dw);
     irq_restore(f);
@@ -223,6 +252,7 @@ void plat_mouse_abs(int x, int y, int dz, int dw, int buttons)
 void vxd_ps2_mouse(int dx, int dy, int dz, int dw, int buttons)
 {
     u32 f = irq_save();
+    mouse_speed(&dx, &dy);
     m_ps2_buttons = (u32)buttons & 0x1F;
     mouse_event(dx, dy, dz, dw);
     irq_restore(f);
@@ -443,6 +473,14 @@ void __cdecl vxd_v86api(u32 vm, struct crs *c)
 {
     u32 fn = c->eax & 0xFFFF;
     u32 ptr = ((u32)c->es << 16) | (c->ebx & 0xFFFF);
+#ifdef WIN_USB
+    if (fn == 3) {
+        /* UNINUSB in a DOS box: Windows' own driver back on the PS/2 mouse devnode; AX = the
+           devnodes changed */
+        c->eax = pnp_active ? (u32)pnp_ps2_restore() : 0;
+        return;
+    }
+#endif
     if (!started) {
         c->eax = 0xFFFF;
         return;
@@ -489,6 +527,7 @@ void __cdecl vxd_pmapi(u32 vm, struct crs *c)
            with another mouse driver it stays with that driver */
         if (!ps2_status()) ps2_start(12);
         ps2_reclaim();
+        if (pnp_active) pnp_ps2_regfile();
 #endif
         mcb_sel = c->ecx & 0xFFFF;
         mcb_off = c->edx & 0xFFFF;
@@ -519,6 +558,13 @@ void __cdecl vxd_pmapi(u32 vm, struct crs *c)
         }
         cur_high = *(u32 *)(vm + 4);
         r = plat_rm(((c->ecx & 0xFFFF) << 16) | (c->edx & 0xFFFF));
+#if defined(WIN_AUDIO) || defined(WIN_USB)
+        if (r->fn == WINF_AUD_DSNODE) {
+            r->status = (u16)(pnp_active ? ds_api_devnode(r) : WINE_NODEV);
+            c->eax = r->status;
+            break;
+        }
+#endif
         vmm_begin_crit();
         r->status = (u16)core_api(r);
         vmm_end_crit();
@@ -1235,6 +1281,16 @@ static void parse_options(const char *s)
         }
         tok[n] = 0;
         if (!n) continue;
+#ifdef WIN_USB
+        if (!strncmp(tok, "SPEED:", 6)) {
+            int v = 0;
+            for (i = 6; tok[i] >= '0' && tok[i] <= '9'; i++) v = v * 10 + (tok[i] - '0');
+            if (v < 25) v = 25;
+            if (v > 400) v = 400;
+            ((struct windos *)((u8 *)cb + WIN_DOSOFF))->mspeed = (u8)(v / 2);
+            continue;
+        }
+#endif
         if (tok[0] == 'R' && tok[1] == ':') {
             int v = 0;
             for (i = 2; tok[i] >= '0' && tok[i] <= '9'; i++) v = v * 10 + (tok[i] - '0');
@@ -1375,6 +1431,35 @@ static int reg_string(const char *path, const char *name, char *out, u32 max)
     vmm_reg_close(k);
     return out[0] ? 0 : -1;
 }
+
+#ifdef WIN_USB
+/* 1 when Windows has a devnode for the PCI function (Enum\PCI): 0 for a controller it never
+   enumerated (an ExpressCard / PCIe card plugged in after the start of Windows) */
+int plat_pnp_known(u32 bdf)
+{
+    static char name[96];
+    char pre[24], inst[32], path[160];
+    u32 k, k2, i;
+    u32 id = pci_rd32((int)(bdf >> 8), (int)((bdf >> 3) & 0x1F), (int)(bdf & 7), 0);
+    int found = 0;
+    if (vmm_version() < 0x400) return 1;
+    ksnprintf(pre, sizeof(pre), "VEN_%04X&DEV_%04X", (u16)id, (u16)(id >> 16));
+    ksnprintf(inst, sizeof(inst), "BUS_%02lX&DEV_%02lX&FUNC_%02lX", bdf >> 8, (bdf >> 3) & 0x1F, bdf & 7);
+    if (vmm_reg_open(HKLM, "Enum\\PCI", &k)) return 1;
+    for (i = 0; i < 256 && !found; i++) {
+        memset(name, 0, sizeof(name));
+        if (vmm_reg_enum(k, i, name, sizeof(name) - 1)) break;
+        if (strncmp(name, pre, 17)) continue;
+        ksnprintf(path, sizeof(path), "Enum\\PCI\\%s\\%s", name, inst);
+        if (!vmm_reg_open(HKLM, path, &k2)) {
+            vmm_reg_close(k2);
+            found = 1;
+        }
+    }
+    vmm_reg_close(k);
+    return found;
+}
+#endif
 
 /* 1 when the PCI function's devnode has this VxD as its device loader, or when that cannot
    be told (no registry yet, no devnode yet: Windows installs the driver later) */
@@ -1545,6 +1630,7 @@ extern void __cdecl vdmad_get_state(u32 h, u32 vm, u32 *out);
 extern void __cdecl vdmad_set_state(u32 h, u32 vm, u32 addr, u32 count, u32 modeflags);
 extern void __cdecl vpicd_request(u32 h, u32 vm, u32 set);
 
+extern void __cdecl thk_int21sb(void);
 static u32 sb_vm, sb_irqh, sb_dmah[2];
 static struct vid sbvid;
 static u32 sb_dlin[2], sb_dcnt[2], sb_dmode[2], sb_dunit[2];
@@ -1694,6 +1780,19 @@ static void sb_port_add(u32 port)
     sb_port[sb_nport++] = (u16)port;
 }
 
+/* INT 21h in a virtual machine: AH 00h / 4Ch (a program ends) in the machine the emulated
+   card belongs to: the card is reset (its transfer stops). 1: the next handler runs. */
+u32 __cdecl vxd_int21sb(u32 vm, struct crs *c)
+{
+    u8 ah = (u8)(c->eax >> 8);
+    if ((ah == 0x4C || ah == 0x00) && vm == sb_vm && sb_active()) {
+        vmm_begin_crit();
+        sb_reset_owner();
+        vmm_end_crit();
+    }
+    return 1;
+}
+
 int plat_sb_start(void)
 {
     struct winsb *c = sb_cfg();
@@ -1721,6 +1820,9 @@ int plat_sb_start(void)
                vmm_hook_fault(1, 13, (void *)thk_pmgp, &pmgp_prev)) {
         kprintf("sb: general protection fault hooks refused\n");
     }
+    /* a program that ends while its sound plays (auto-init DMA) leaves the card playing the
+       buffer it gave: the emulated card is reset when a program of its machine ends */
+    if (vmm_hook_v86_int(0x21, (void *)thk_int21sb)) kprintf("sb: INT 21h hook refused\n");
     sb_dunit[0] = 1;
     sb_dunit[1] = 2;
     sb_dmah[0] = vdmad_virtualize(c->dma8, (void *)thk_sbdma);

@@ -1,4 +1,4 @@
-# WINUSB 1.1 — USB driver for DOS and Windows 1.0–3.11 / 95 / 98 / ME
+# WINUSB 1.2 — USB, Thunderbolt and touchpad driver for DOS, Windows 1.x / 2.x / 3.x / 95 / 98 / ME
 
 The complete manual. **README.md** has the short overview and the installation.
 
@@ -71,8 +71,8 @@ together with the others:
 |--------|------|
 | MS-DOS 5.0 / 6.x | disks, keyboard, mouse (PS/2 path and INT 33h), touchpads, USB CD/DVD (MSCDEX), sound (`AUDTEST /USB`), USB4 / Thunderbolt (NVMe, docks) |
 | MS-DOS 7.0 / 7.1 / 8.0, FreeDOS | the same; FAT32 partitions on 7.1, 8.0 and FreeDOS; with Windows 95/98/ME installed too (MS-DOS mode, DOS boxes) |
-| Windows 1.0x | USB keyboard, disks (as letters), mouse (INT 33h) + wheel (cursor-key scrolling) |
-| Windows 2.x (real mode) | USB keyboard, disks (as letters), mouse (INT 33h / "Microsoft Mouse") + wheel (cursor-key scrolling) |
+| Windows 1.0x | USB keyboard, disks (as letters), mouse (WINMOU12.DRV linked in by INSTUSB when Setup chose no mouse; INT 33h) + wheel (cursor-key scrolling) |
+| Windows 2.x (real mode) | USB keyboard, disks (as letters), mouse (WINMOU12.DRV when Setup chose no mouse; INT 33h / "Microsoft Mouse") + wheel (cursor-key scrolling) |
 | Windows/386 2.x | **does not work** (see "Known limitations") |
 | Windows 3.0 Real Mode | keyboard, mouse, touchpads, disks, camera, beeps (`WINBEEP.DRV`) |
 | Windows 3.0 Standard / 386 Enhanced Mode | everything (sound with the Multimedia Extensions) |
@@ -96,7 +96,7 @@ Files used by several systems are in each of their folders. The installer is run
 
 | Folder | Files |
 |--------|-------|
-| `bin/DOS` | `AUDTEST.EXE`, `DSKBENCH.EXE`, `INSTUSB.EXE`, `MANUAL.TXT`, `README.TXT`, `UNINUSB.EXE`, `WININFO.EXE`, `WINUCD.SYS`, `WINUCORE.BIN`, `WINUSB.SYS` |
+| `bin/DOS` | `AUDTEST.EXE`, `DSKBENCH.EXE`, `INSTUSB.EXE`, `MANUAL.TXT`, `README.TXT`, `UNINUSB.EXE`, `WININFO.EXE`, `WINMOU12.DRV`, `WINUCD.SYS`, `WINUCORE.BIN`, `WINUSB.SYS` |
 | `bin/WIN3X` | `OEMSETUP.INF`, `USBTREE.EXE`, `WIN30FIX.COM`, `WINBEEP.DRV`, `WINCAM.EXE`, `WINGRP.EXE`, `WINMIX.EXE`, `WINMOUSE.DRV`, `WINSOUND.DRV`, `WINUSB.386`, `WINUSB.TXT`, `WINWHEEL.EXE` |
 | `bin/WIN9X` | `USBD.SYS`, `USBTREE.EXE`, `WIN4G.VXD`, `WINCAM.EXE`, `WINDRVCI.DLL`, `WINGRP.EXE`, `WINKBD.INF`, `WINMIX.EXE`, `WINMOU.INF`, `WINMOUSE.DRV`, `WINSOUND.DRV`, `WINUSB.INF`, `WINUSB.PDR`, `WINUSB.TXT`, `WINUSB.VXD`, `WINUSBA.INF`, `WINUSBD.INF`, `WINUSBH.INF`, `WINUSBS.INF`, `WINUSBV.INF`, `WINUSBW.SYS`, `WINWHEEL.EXE` |
 
@@ -120,7 +120,7 @@ Files used by several systems are in each of their folders. The installer is run
     scroll. DOS programs that read the wheel themselves get the **INT 33h wheel API**
     (CuteMouse, function 11h), which turns the key translation off for them.
   * **1.0x:** USB keyboard, USB disks and the mouse wheel (cursor keys); the mouse with a
-    driver that uses INT 33h
+    driver that uses INT 33h, or WINMOU12.DRV (below)
   * **Windows/386 2.x:** no USB service while it runs (V86 mode without VCPI)
   * **95, 98, ME:** everything, as Plug and Play drivers (§3b)
 * For a USB keyboard / mouse in DOS, Real and Standard Mode: an 8042-compatible keyboard
@@ -142,6 +142,7 @@ Files used by several systems are in each of their folders. The installer is run
 | `MANUAL.TXT`   | DOS | this manual (code page 437) |
 | `WINUSB.386`   | WIN3X | Windows 386 Enhanced Mode VxD, in the directory of WINUSB.SYS (loaded automatically) |
 | `WINMOUSE.DRV` | WIN3X, WIN9X | Windows mouse driver: USB + PS/2, wheel, back / forward buttons, tablets |
+| `WINMOU12.DRV` | DOS | the same driver for Windows 1.x/2.x (USB + PS/2 mice), linked into WIN100.BIN / WIN200.BIN by INSTUSB |
 | `WINWHEEL.EXE` | WIN3X, WIN9X | passes the wheel / horizontal wheel to programs, autoscroll |
 | `USBTREE.EXE`  | WIN3X, WIN9X | USB tree, descriptors, disks, log, safe removal, report |
 | `WINCAM.EXE`   | WIN3X, WIN9X | USB camera picture, photos, video |
@@ -204,8 +205,20 @@ sets each up for its version (`/W:dir` selects one). It
   MMSYSTEM (`sndPlaySound`).
 * adds the **WINUSB** group (USB Devices, Camera, Volume Control, Disk Info, Read Me) to
   Program Manager on Windows 3.0 / 3.1 and to the Start menu on Windows 95/98/ME;
-  installing again does not duplicate lines or group items,
-* on Windows 1.0x / 2.x sets up only CONFIG.SYS and tells which mouse driver to use.
+  installing again does not duplicate lines or group items.
+  Windows 3.x also get an **Uninstall WINUSB** item (the package's icon with a red cross): the
+  uninstaller is a DOS program, so Windows closes, runs `UNINUSB.EXE /REBOOT` and the
+  computer restarts when it is done. Windows 95/98/ME get the programs as **shortcuts on the
+  desktop** too (`WINDOWS\DESKTOP`); the uninstaller removes them with the programs.
+  Windows 1.0x / 2.x have no Program Manager (MS-DOS Executive lists the files);
+* on Windows 1.0x / 2.x (no SYSTEM.INI: Setup links the drivers into WIN100.BIN / WIN200.BIN
+  and WIN100.OVL / WIN200.OVL) links **WINMOU12.DRV** in as the MOUSE module when Setup chose
+  no mouse — then Windows has no pointer at all. Its USB mice come from WINUSB.SYS, PS/2 mice
+  through the 8042. The files as they were are kept as `WIN?00.WUB` / `WIN?00.WUO`; UNINUSB
+  links Setup's MOUSE module back from them. A mouse driver chosen in Setup stays (USB mice
+  reach the PS/2 one through the 8042). WINVBE links its display driver the same way from
+  its own copies of Setup's files: when WINVBE was there before WINUSB, installing WINVBE
+  again drops WINMOU12.DRV, and INSTUSB has to run once more.
 
 The original of every changed file is saved once with the `.WNU` extension (`CONFIG.WNU`,
 `SYSTEM.WNU`, `WIN.WNU`). Running it again is safe; the old options are kept unless `/O` is
@@ -214,8 +227,10 @@ given.
 Uninstall: `C:\WINDOWS\UNINUSB` removes the CONFIG.SYS line, restores the previous mouse
 driver, removes WINWHEEL from `load=` and the `[WinWheel]` / `[WINUSB]` sections, the group,
 WINMOUSE.DRV and the package files (no other file of the Windows directory is touched)
-(`/K` keeps the files, `/W:dir` names the Windows directory). WININFO / DSKBENCH stay when
-WINDISK is installed in the same directory.
+(`/K` keeps the files, `/W:dir` names the Windows directory), and the desktop shortcuts of
+Windows 95/98/ME. WININFO / DSKBENCH stay when WINDISK is installed in the same directory.
+`/REBOOT` waits for a key and restarts the computer at the end (the Uninstall item of
+Windows 3.x).
 
 Manual installation:
 
@@ -248,6 +263,7 @@ Manual installation:
 | `XButtons` | 1 | buttons 4 and 5 (back / forward) as Alt+Left / Alt+Right; 0: off |
 | `AutoScroll` | 1 | a wheel click starts autoscroll in windows with a scroll bar |
 | `AutoScrollSpeed` | 100 | autoscroll speed (percent, 10–1000) |
+| `MouseSpeed` | (none) | pointer speed of the USB mice and touchpads (percent, 25–400), set by USBTREE |
 | `NoAutoScroll` | IE, Word, Excel, Mozilla, Opera window classes | window classes of programs that handle the wheel click themselves (comma separated) |
 
 **Autoscroll:** a short press of the wheel turns the pointer into a four-way scroll cursor
@@ -368,12 +384,25 @@ How it works:
 * **Static start:** `WINUSB.VXD` loaded at boot starts only the USB controllers whose
   installed driver (Device Manager) is WINUSB; controllers that have Windows' own UHCI /
   OHCI / EHCI driver are left to it (both drivers on one controller freeze the machine).
+  So the WINDRV driver is needed only on the controllers whose ports WINUSB should serve
+  (an add-in USB 3.0 card, say); the others can keep Windows' driver, and a device works
+  with the driver of the controller its port belongs to. A controller Windows never
+  enumerated (an ExpressCard or PCIe card plugged in after the start of Windows) is started
+  too; its devices get their devnodes under another WINUSB controller (with no WINUSB
+  controller in Device Manager they show only in USBTREE until the next start).
+* **USB disks without a drive letter on Windows 95 / 98 / ME:** the disk is in USBTREE (with
+  its partitions) but Windows gives no letter when its partitions are not FAT12 / 16 / 32
+  (exFAT and NTFS, as most sticks above 32 GB come formatted; Windows 98 / ME give a letter
+  to a disk without FAT partitions but cannot read it), when "New Hardware Found" for the
+  disk was cancelled (Device Manager, Disk drives: the "USB ... Disk" with a yellow mark;
+  Update Driver, `WINDOWS\INF`), or on Windows 95 without the FAT32 release (OSR2) for a
+  FAT32 stick.
 * Thunderbolt / USB4: when the NHI devnode is given to WINUSB.VXD the tunnels are set up as
   in DOS; the xHCI / NVMe functions behind a tunnel are driven by WINUSB directly (the PCI
   enumerator of Windows 9x knows nothing of PCIe hot plug; these devices do not appear in
   Device Manager separately).
-* Limits: USB sound / MIDI and cameras are used through WINSOUND.DRV and WINCAM as on DOS /
-  3.x (no DirectSound / VFW interface). In QEMU, DOS boxes close ("must be run in MS-DOS
+* Limits: USB sound / MIDI play through WINSOUND.DRV and the DirectSound driver of
+  WINUSB.VXD (§5), cameras through WINCAM (no VFW interface). In QEMU, DOS boxes close ("must be run in MS-DOS
   mode") while SeaBIOS uses a USB keyboard or mouse it saw at boot: SeaBIOS's USB HID code
   in the timer interrupt cannot run in V86 mode. That is specific to QEMU.
 
@@ -456,6 +485,8 @@ listing the drive).
 | `/PCIHP` | watch every hot-plug capable PCIe port, Thunderbolt or not (ExpressCard, PCIe slots) |
 | `/NVME`, `/NONVME` | NVMe controllers behind tunnels: also take over the one the BIOS started / never use them |
 | `/DOSDISK` | accepted for compatibility, no effect: the DOS driver gives drive letters with Windows 95/98/ME installed too |
+| `/SPEED:n` | pointer speed of USB mice, touchpads and (Windows) PS/2 mice, 25 to 400 percent (default 100) |
+| `/Q`     | quiet: only error messages on the screen at boot |
 
 ## 4. How it works
 
@@ -526,11 +557,11 @@ of Windows 1.0x–3.11 and Windows 95/98/ME.
 | one finger | pointer (8 counts per millimetre; Windows' mouse speed and acceleration apply) |
 | two fingers up / down | wheel (one notch per 2.5 mm; fingers down → page down) |
 | two fingers left / right | horizontal wheel |
-| short tap | left click; two fingers: right click; three fingers: middle click |
+| short tap (the finger lifted within 300 ms, never 3 mm from where it touched) | left click; two fingers: right click; three fingers: middle click |
 | two taps | double click (each tap is a click of its own) |
 | tap, then touch again and move | drag (the button stays down until the finger lifts) |
 | three fingers left / right | back / forward (buttons 4 and 5: Alt+Left / Alt+Right) |
-| touchpad button / clickpad | left click; right click while two fingers touch |
+| touchpad button / clickpad | left click; right click while two fingers touch; a finger moving while the button is held (the thumb on the button or its area) moves the pointer |
 | TrackPoint | pointer; scrolling while the middle button is held, a middle click on its own |
 
 * **USB and I2C precision touchpads** (Windows Precision Touchpad) are recognized by the
@@ -668,7 +699,7 @@ the first tries on real Thunderbolt / USB4 hardware take a log with `/D /S`.
   becomes a sound device.
 * **Format:** the device's best setting is chosen (2 channels, 16 / 24 / 32 bit, preferably
   48 kHz, else 44.1 / 96 kHz …); programs can use any PCM format (8 / 16 / 24 / 32 bit,
-  float, 1–8 channels, 2–192 kHz); conversion and mixing of up to 16 streams are done in
+  float, 1–8 channels, 2–192 kHz); conversion and mixing of up to 32 streams are done in
   software (polyphase sinc sample rate converter).
 * **Synchronization:** asynchronous devices are followed through their feedback endpoint;
   adaptive and synchronous devices are fed at the nominal rate.
@@ -682,16 +713,26 @@ the first tries on real Thunderbolt / USB4 hardware take a log with `/D /S`.
   devices too ("WIN USB GM Synth").
 * **Hot plug:** programs using a removed device do not hang (their buffers complete), the
   device stays in the list as "unplugged"; the same device plugged in again gets the same
-  device number and settings. MMSYSTEM reads the number of devices only at start, so
-  WINSOUND.DRV keeps room for up to 2 USB sound devices plugged in while Windows runs ("WIN
-  USB Audio 1/2"); a device plugged in later is bound to those. WINMIX updates its list live.
+  device number and settings. Windows 3.x: MMSYSTEM reads the number of devices only at
+  start, so WINSOUND.DRV keeps room for up to 2 USB sound devices plugged in while Windows
+  runs ("WIN USB Audio 1/2"); a device plugged in later is bound to those. Windows 95 / 98 /
+  ME: every USB sound device has a devnode of its own (`WINUSBA.INF`: DevLoader
+  MMDEVLDR.VXD, driver WINUSB.VXD) and MMSYSTEM loads WINSOUND.DRV for it when it is plugged
+  in, so it appears under its own name with its mixer; no entries are reserved. WINMIX
+  updates its list live.
   With WINAUDIO installed too, the Sound Blaster 16 emulation of WINAUDIO plays on the first
   USB Audio output when the machine has no other sound device (WINAUDIO's `/USBSB`: always),
   in DOS (WINUSB.SYS `/USB` loaded before WINAUDIO.SYS), in Windows 3.x and in Windows
   95 / 98 / ME (WINAUDIO manual §3b).
-  On Windows 95 / 98 / ME the devices present at the start of Windows also get a mixer
-  (Volume Control, the volume icon of the taskbar); the volumes are kept in SYSTEM.INI
-  `[winsound.drv]` across restarts.
+  On Windows 95 / 98 / ME the devices also get a mixer (Volume Control, the volume icon of
+  the taskbar); the volumes are kept in SYSTEM.INI `[winsound.drv]` across restarts.
+* **DirectSound (Windows 95 / 98 / ME with DirectX):** WINUSB.VXD registers a DirectSound
+  driver for every USB Audio output ("<device> (WINUSB)", module WINUSB.VXD) with a hardware
+  primary buffer and up to 16 hardware secondary buffers (rate, volume, pan, position,
+  looping, duplicates), the same driver as WINAUDIO's (WINAUDIO manual §3a). It is
+  registered when the device is plugged in and deregistered when it is pulled out. A device
+  installed with an earlier WINUSBA.INF (`DevLoader=WINUSB.VXD`) needs Update Driver (Have
+  Disk, `WINDOWS\INF`) once for it.
 * **DOS:** `AUDTEST /USB` plays and records in DOS too (WINSOUND.DRV uses the same path in
   Standard Mode). In Standard Mode and DOS packets are scheduled 150 ms ahead, in Enhanced
   Mode 40 ms.
@@ -735,8 +776,12 @@ DSKBENCH /U:0 /M:64 /N   raw read from WINUSB disk 0
 
 USBTREE: on the left a lined tree of controllers / ports / devices (coloured marks by device
 type) and a "Disks and partitions" item, on the right details and descriptors; Refresh, Safe
-remove, Log, Save (full report; with the file dialog when COMMDLG is there), Auto refresh
-(every 2 seconds, on change). With WINDISK loaded the disk view shows its disks, CD/DVD
+remove, Log, Save (full report; with the file dialog when COMMDLG is there), Mouse speed,
+Auto refresh (every 2 seconds, on change). **Mouse speed...** (enabled when a USB mouse is
+selected) sets the pointer speed of all USB mice and touchpads, 25 to 400 percent, while the
+slider moves; OK keeps it (Windows 95/98/ME: in the registry, set again when WINUSB starts;
+Windows 3.x: `[WinWheel] MouseSpeed=` of WIN.INI, set again by WINWHEEL.EXE), Cancel goes
+back. `/SPEED:n` is the speed at the start of the driver. With WINDISK loaded the disk view shows its disks, CD/DVD
 drives and SD cards too, with partitions and file systems.
 
 ## PCI resources above 4 GB
@@ -910,8 +955,7 @@ taken over, class icons, booting from a USB stick, USB CD/DVD).
   code. Sound (the camera's microphone) works separately as USB Audio and is not recorded
   into the AVI. H.264 cameras and uncompressed sizes above 640×480 are not supported; in
   Windows 3.0 Real Mode 640×480 NV12 does not fit into memory.
-* **Windows 95 / 98 / ME:** USB sound / MIDI and cameras only through WINSOUND.DRV and WINCAM
-  (no DirectSound / VFW). A Windows booted from a USB stick cannot reach that disk through the
+* **Windows 95 / 98 / ME:** cameras only through WINCAM (no VFW). A Windows booted from a USB stick cannot reach that disk through the
   BIOS after shutdown ("It's now safe..." screen, "Restart in MS-DOS mode"). The WDM bridge
   (§3c) has no isochronous transfers.
 * **BIOS legacy USB support:** WINUSB takes the controllers over from the BIOS (the
@@ -922,6 +966,39 @@ taken over, class icons, booting from a USB stick, USB CD/DVD).
   support" off, or try `/NOKBC` and `/NOTP`, and send the log of `WINUSB.SYS /D /S`.
 
 ## Version history
+
+**1.2 (2 November 2026)**
+
+Changelog:
+
+- **Windows 1.x/2.x pointer:** without a mouse chosen in Setup, Windows 1.x/2.x had no pointer at all (Setup links a stub as the MOUSE module into WIN100.BIN / WIN200.BIN). INSTUSB now links WINMOU12.DRV in its place — WINMOUSE built for Windows 1.x/2.x, USB mice through WINUSB.SYS and PS/2 mice through the 8042 — the way WINVBE links its display driver, keeping the files as `WIN?00.WUB` / `WIN?00.WUO`; UNINUSB links Setup's module back. Tried in QEMU with Windows 1.01 and 2.03 installed without a mouse: pointer, clicks and menus with a PS/2 mouse and with a USB mouse on xHCI, and UNINUSB brings back Setup's state; the linking gives the same files as WINVBE's algorithm.
+- WINMOUSE.DRV in Windows 3.x Standard / Real Mode and WINMOU12.DRV: with a PS/2 wheel mouse (4-byte packets) the horizontal motion was lost (the fourth byte overwrote it), the pointer moved only up and down.
+- Program Manager (Windows 3.x): an **Uninstall WINUSB** item with a red cross on the USB icon (Windows closes, `UNINUSB /REBOOT` runs and restarts the computer); Windows 95/98/ME: the programs as desktop shortcuts too (long names, also when installed from plain DOS), removed by the uninstaller. The banner lists the systems (DOS, Windows 1.x/2.x/3.x/95/98/ME).
+- **DirectSound driver for USB Audio devices (Windows 95/98/ME with DirectX):** WINUSB.VXD registers a DirectSound driver for every USB Audio output, with the primary buffer and hardware secondary buffers like WINAUDIO's; it is registered when the device is plugged in and taken away when it is pulled out. WINUSBA.INF makes MMDEVLDR.VXD the DevLoader of the USB sound devices: MMSYSTEM loads WINSOUND.DRV for each of them when it is plugged in (no more reserved "WIN USB Audio 1 / 2" entries), so programs see the device by its name and DirectSound finds its driver. After updating, choose Update Driver for the USB sound device in Device Manager once (Have Disk, `WINDOWS\INF`). Verified in Windows 98 with QEMU's USB Audio device, unplugged and plugged in again.
+- USB WDM bridge (Windows 98 / ME): the other interfaces of a sound device WINUSB plays itself (audio streaming, MIDI) are no longer offered to Windows (Windows asked for its USB audio driver for them).
+- xHCI: a short packet that the controller reports as success with a residual length (Fresco Logic FL1000 / FL1100, as Linux's XHCI_TRUST_TX_LENGTH) ends the transfer; the transfer waited for the rest and timed out.
+- Windows 95/98/ME: the devices of a USB controller Windows never enumerated (an ExpressCard or PCIe card plugged in after the start of Windows) get their devnodes, disks their letters, under another WINUSB controller; before, they were seen in USBTREE only.
+- **UNINUSB on Windows 95/98/ME puts Windows' own PS/2 mouse driver back:** WINUSB.VXD keeps Windows' values of the PS/2 mouse devnode when it takes it over (in the registry and in `SYSTEM\WINUSBPS.REG`); UNINUSB in an MS-DOS box has the running VxD write them back, in MS-DOS mode it imports the file with the real-mode REGEDIT, and it restores `[386Enh] mouse=*vmouse, msmouse.vxd` (Windows had made it `*vmd`). The mouse was dead after uninstalling until a PS/2 mouse was installed again.
+- UNINUSB leaves `[drivers] wave= / midi= / mixer=winsound.drv` alone while WINAUDIO is installed (its sound devices had no wave driver until INSTAUD ran again), and files Windows has open (WINWHEEL.EXE) are deleted at the next start of Windows (WININIT.INI).
+- Mice and touchpads: `/SPEED:n` (25 to 400 percent, also in the `Options` of Windows 95/98/ME) sets the pointer speed of USB mice, touchpads and (in Windows) PS/2 mice.
+- USBTREE: **Mouse speed...** for USB mice: a slider (25 to 400 percent) that sets the pointer speed of all USB mice and touchpads at once while it is moved. The setting stays: Windows 95/98/ME keep it in the registry (set again when WINUSB starts), Windows 3.x in WIN.INI `[WinWheel] MouseSpeed=` (set again by WINWHEEL.EXE); `/SPEED:n` stays the setting at the start of the driver.
+- WINSOUND.DRV works also as the driver of a devnode (Windows 95/98/ME, WINAUDIO's sound devices): each instance has the devices of its devnode, the one of SYSTEM.INI `[drivers]` the others (USB Audio).
+- Touchpads (PS/2, SMBus, I2C and USB): a tap is recognized by how far the finger got from where it touched (the small jitter of a resting finger no longer makes taps fail) and may last 300 ms; moving a finger while a pad button is held (or with the thumb resting on the button area) moves the pointer at full speed instead of scrolling or slowing down.
+- DOS and Windows 3.x Standard Mode: USB controllers that share their interrupt line with other devices are polled 256 times a second through the RTC as well, not only on the 18.2 Hz timer tick (slow, jerky USB mice; gaps in USB Audio).
+- Windows 3.x Standard Mode: when Windows' own PS/2 mouse driver runs (not WINMOUSE.DRV), the PS/2 touchpad goes back to its mouse mode until Windows ends (PS/2 mouse and keyboard stopped working, e.g. on the ThinkPad T43).
+- The installer puts WINUSB.SYS after the last DEVICE line of CONFIG.SYS (the drivers that need it, WINAUDIO.SYS and WINUCD.SYS, stay after it): the USB drives get the letters after those of all other block device drivers.
+- USB Audio: a type I format without a general descriptor (or without its format tag) counts as PCM; the log names every streaming setting that cannot be used and why (C-Media 0D8C:0008 not found as a sound device).
+- USB Audio mixer settings are kept across restarts: Windows 95/98/ME in the registry, DOS in `WINUSB.VOL` (written by `AUDTEST /USB MIX ...`, set again by WINUSB.SYS).
+- WINUCD.SYS says how many USB CD/DVD drives it found; internal IDE / SATA drives are WINDISK's (WINCD.SYS).
+- WINSOUND.DRV: 64 buffers per stream and sample-accurate positions for DirectSound in emulation mode and players that queue many small buffers.
+- The installer lists the Windows installations it finds, numbered, and asks which of them to set up (`1`, `1,3`, `A` for all, `0` for none: the DOS driver only); `/ALL` sets up all of them without asking, `/W:dir` only that one.
+- The DOS driver takes its extended memory above 16 MB when there is room there: Windows 3.x Standard Mode (and other 286 DOS extenders) can use only the memory below 16 MB ("Insufficient extended memory" with all WINDRV drivers loaded).
+- `/Q`: only error messages on the screen while the DOS driver loads.
+- Fixed "CPU without CPUID / time stamp counter" on Vortex86 DX / MX / EX processors, whose CPUID instruction works although the ID flag of EFLAGS cannot be changed: the time stamp counter is tried directly.
+- WININFO finds the driver also when it was loaded with DEVLOAD and a program (the command shell) later put back an INT 2Fh vector it had saved before: the driver hooks INT 2Fh again within a few seconds, and WININFO waits for that when the driver's device header is there.
+- Fixed a crash at boot ("CORE EXCEPTION 0000000E") with `DEVICEHIGH=` under JEMM386 / JEMMEX: the driver used the memory after its image as a buffer while it started, and a small upper memory block ends right there; the buffer now fits in the block DOS gave.
+- The texts of the DOS drivers, the VxDs and the documentation name everything the drivers support now.
+
 
 **1.1 (26 October 2026)**
 

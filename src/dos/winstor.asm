@@ -16,7 +16,7 @@
 %ifdef PKG_USB
 %define DRVNAME         'WINUSB'
 %define HDRNAME         'WINUSB '
-%define BANNER          'WINUSB 1.1 - USB driver for DOS and Windows 1.0-3.11'
+%define BANNER          'WINUSB 1.2 - USB, Thunderbolt, touchpad - DOS, Windows 1.x/2.x/3.x/95/98/ME'
 %define COREFILE        'WINUCORE.BIN'
 %define VXDFILE         'WINUSB.386'
 %define DOSACTIVE       'USB active in DOS / standard mode'
@@ -24,7 +24,7 @@ MPLEXID         equ 0D4h
 DEFSLOTS        equ 2
 %elifdef PKG_AUDIO
 %define DRVNAME         'WINAUDIO'
-%define BANNER          'WINAUDIO 1.1 - HD Audio / AC97 sound driver for Windows 3.0-3.11'
+%define BANNER          'WINAUDIO 1.2 - HD Audio/AC97/DSP/AudioPCI/SB Live - DOS, Windows 3.x/95/98/ME'
 %define COREFILE        'WINACORE.BIN'
 %define VXDFILE         'WINAUDIO.386'
 %define DOSACTIVE       'sound active in DOS / standard mode'
@@ -34,7 +34,7 @@ DEFSLOTS        equ 0
 %define PKG_DISK
 %define DRVNAME         'WINDISK'
 %define HDRNAME         'WINDISK'
-%define BANNER          'WINDISK 1.1 - IDE/AHCI/NVMe disk driver for DOS and Windows 3.0-3.11'
+%define BANNER          'WINDISK 1.2 - IDE/AHCI/NVMe/SD/eMMC disks - DOS, Windows 1.x/2.x/3.x/95/98/ME'
 %define COREFILE        'WINDCORE.BIN'
 %define VXDFILE         'WINDISK.386'
 %define DOSACTIVE       'active'
@@ -53,6 +53,8 @@ CBF_AUXBIOS     equ 0800h
 CBF_MBOX        equ 1000h
 CBF_HAVEDISK    equ 2000h
 CBF_CHARDEV     equ 4000h
+CBF_QUIET       equ 00010000h
+CBF_WINSTD      equ 00020000h
 
 OPT_USB         equ 0001h
 OPT_NOAHCI      equ 0002h
@@ -104,6 +106,7 @@ OPT2_NOTPVOL    equ 4000h
 OPT2_USBSB      equ 8000h
 
 FN_INIT         equ 0
+WINF_AUD_VOLS   equ 0056h
 FN_DOS          equ 1
 FN_POLL         equ 2
 FN_IRQ          equ 3
@@ -122,6 +125,7 @@ SBF_NOMPU       equ 04h
 SBF_DOSTRAP     equ 08h
 SBF_RTC         equ 10h
 SBF_OFF         equ 80h
+SBX_NOMODE      equ 01h
 CBF_FWREQ       equ 8000h
 CB_FWTAB        equ 448
 WIN_MAXFW       equ 16
@@ -153,6 +157,8 @@ VMF_WIN         equ 0020h
 VMF_WINSTD      equ 0100h
 VMF_VCPI        equ 0200h
 VMF_USEVME      equ 0400h
+VMF_NOEMS       equ 0800h
+VMF_EMS         equ 1000h
 SBF_V86         equ 40h
 VMB             equ cb + 2304           ; struct winvm (WIN_VMOFF)
 VM_FLAGS        equ VMB + 0
@@ -177,6 +183,7 @@ VM_NCBF         equ VMB + 37
 VM_OIRET        equ VMB + 38
 VM_BIOS70       equ VMB + 40
 VM_ORMTGT       equ VMB + 56
+VM_EMSMB        equ VMB + 59
 VM_OVMON        equ VMB + 60
 ; VCPI gateway data (VMGW_* in winapi.h)
 VMGW_CR3        equ 0
@@ -970,6 +977,10 @@ int2f:
 
 .winstart:
         test dx, 1                      ; standard mode (DOSX): keep the DOS core
+        jz .wsenh
+        or byte [cs:cb+CB_FLAGS+2], CBF_WINSTD >> 16
+.wsenh:
+        test dx, 1
 %ifdef PKG_AUDIO
         jz .enh
         or word [cs:VM_FLAGS], VMF_WINSTD       ; it needs VCPI from the monitor
@@ -981,6 +992,9 @@ int2f:
 %ifdef PKG_AUDIO
         call sb_rtc_off
         call vm_emmoff
+%endif
+%ifdef PKG_USB
+        call usb_rtc_off
 %endif
         pushf
         call far [cs:old2f]
@@ -1029,6 +1043,10 @@ int2f:
 
 .winexit:
         test dx, 1
+        jz .wxenh
+        and byte [cs:cb+CB_FLAGS+2], ~(CBF_WINSTD >> 16)
+.wxenh:
+        test dx, 1
 %ifdef PKG_AUDIO
         jz .enx
         and word [cs:VM_FLAGS], ~VMF_WINSTD
@@ -1076,7 +1094,114 @@ int2f:
 %ifdef PKG_AUDIO
         call sb_rtc_on
 %endif
+%ifdef PKG_USB
+        call usb_rtc_on
+%endif
         jmp far [cs:old2f]
+
+%ifdef PKG_USB
+; ---------------------------------------------------------------------------
+; A controller polled (its IRQ is shared with other devices) would be served only on the
+; 18.2 Hz timer tick: a USB mouse reports at most 127 counts per report, so it moves slowly
+; and in steps, and the sound of a USB Audio device has gaps. In DOS and Windows standard
+; mode the RTC periodic interrupt (1024 Hz, every fourth one used) polls the core too. The
+; BIOS handler of INT 70h (called first) acknowledges the RTC and the PICs.
+old70u          dd 0
+usb_rtcon       db 0
+usb_rtcwant     db 0
+usb_rtcb        db 0
+usb_rdiv        db 0
+int70u:
+        pushf
+        call far [cs:old70u]
+        cmp byte [cs:usb_rtcon], 0
+        je .x
+        push ax
+        mov al, 0Bh                     ; the BIOS may turn the periodic interrupt off
+        out 70h, al                     ; when its own wait (INT 15h 86h) ends
+        in al, 71h
+        test al, 40h
+        jnz .pie
+        or al, 40h
+        mov ah, al
+        mov al, 0Bh
+        out 70h, al
+        mov al, ah
+        out 71h, al
+.pie:   pop ax
+        inc byte [cs:usb_rdiv]
+        test byte [cs:usb_rdiv], 3
+        jnz .x
+        call dos_safe
+        jc .x
+        call do_poll
+.x:     iret
+
+usb_rtc_on:
+        cmp byte [cs:usb_rtcwant], 0
+        je .x
+        cmp byte [cs:usb_rtcon], 0
+        jne .x
+        push ax
+        pushf
+        cli
+        mov al, 0Ah                     ; rate: the standard 1024 Hz if none is set
+        out 70h, al
+        in al, 71h
+        test al, 0Fh
+        jnz .rate
+        or al, 06h
+        mov ah, al
+        mov al, 0Ah
+        out 70h, al
+        mov al, ah
+        out 71h, al
+.rate:  mov al, 0Bh
+        out 70h, al
+        in al, 71h
+        mov [cs:usb_rtcb], al
+        or al, 40h
+        mov ah, al
+        mov al, 0Bh
+        out 70h, al
+        mov al, ah
+        out 71h, al
+        mov al, 0Ch
+        out 70h, al
+        in al, 71h
+        in al, 0A1h
+        and al, 0FEh
+        out 0A1h, al
+        in al, 21h
+        and al, 0FBh
+        out 21h, al
+        mov byte [cs:usb_rtcon], 1
+        popf
+        pop ax
+.x:     ret
+
+usb_rtc_off:
+        cmp byte [cs:usb_rtcon], 0
+        je .x
+        push ax
+        pushf
+        cli
+        mov byte [cs:usb_rtcon], 0
+        mov al, 0Bh
+        out 70h, al
+        in al, 71h
+        and al, 0BFh
+        mov ah, [cs:usb_rtcb]
+        and ah, 40h
+        or ah, al
+        mov al, 0Bh
+        out 70h, al
+        mov al, ah
+        out 71h, al
+        popf
+        pop ax
+.x:     ret
+%endif
 
 ; ---------------------------------------------------------------------------
 ; INT 33h: the standard DOS mouse API, backed by the USB mouse. Position is kept up to date
@@ -1310,12 +1435,56 @@ int08:
 %endif
         call dos_safe
         jc .x
+        call chk2f
         call do_poll
 .x:
 %ifdef PKG_AUDIO
         call sb_deliver
 %endif
         iret
+
+; The INT 2Fh hook (the API of the driver) must stay reachable. A program that took the
+; vector before the driver hooked it (the command shell, when the driver came later with
+; DEVLOAD) may put its old value back. Every 64 ticks, when the vector is not this
+; driver's: the installation check through the chain, and when nobody answers it, the
+; driver hooks INT 2Fh again.
+chk2f_cnt       db 0
+chk2f:
+        cmp byte [cs:handover], 0
+        jne .r
+        inc byte [cs:chk2f_cnt]
+        test byte [cs:chk2f_cnt], 63
+        jnz .r
+        push ds
+        push es
+        pusha
+        xor ax, ax
+        mov ds, ax
+        mov ax, cs
+        cmp word [2Fh*4], int2f
+        jne .probe
+        cmp [2Fh*4+2], ax
+        je .ok
+.probe: mov ah, [cs:mplex]
+        xor al, al
+        xor bx, bx
+        int 2Fh
+        cmp al, 0FFh
+        jne .re
+        cmp bx, 3357h
+        je .ok
+.re:    cli
+        mov ax, [2Fh*4]
+        mov [cs:old2f], ax
+        mov ax, [2Fh*4+2]
+        mov [cs:old2f+2], ax
+        mov word [2Fh*4], int2f
+        mov [2Fh*4+2], cs
+        sti
+.ok:    popa
+        pop es
+        pop ds
+.r:     ret
 
 %ifdef PKG_USB
 ; Empty drive letters are hidden from DOS: the Current Directory Structure entry of a slot
@@ -2424,8 +2593,12 @@ SB_NTRAPS       equ cb + WIN_SBOFF + 44
 SB_IRQS         equ cb + WIN_SBOFF + 46
 SB_TTICKS       equ cb + WIN_SBOFF + 48
 SB_SPEC         equ cb + WIN_SBOFF + 52
+SB_XFLAGS       equ cb + WIN_SBOFF + 76
 
 old70           dd 0
+qpi_prev        dd 0            ; the trap callback before ours (QEMM 7.5 traps DMA ports itself)
+sb_mine         times 128 db 0  ; ports 0-3FFh trapped for the emulation (bitmap)
+sb_pmap         times 128 db 0  ; ports 0-3FFh the previous callback traps (bitmap)
 sb_rtcon        db 0            ; the RTC periodic interrupt drives the emulation
 sb_inrtc        db 0
 sb_tdiv         db 0
@@ -2445,9 +2618,17 @@ rtc_stack       times 640 db 0
 rtc_stack_top:
 
 ; QPI port trap callback: DX = port, CL bit 2 = output, AL = data. Returns AL for an input;
-; every other register is preserved. Interrupts are disabled.
+; every other register is preserved. Interrupts are disabled. The ports of the callback
+; installed before (QEMM's DMA translation) go on to it.
 sb_trap:
-        push eax
+        cmp dword [cs:qpi_prev], 0
+        je .mine
+        cmp dx, 400h
+        jae .prev
+        bt word [cs:sb_mine], dx
+        jc .mine
+.prev:  jmp far [cs:qpi_prev]
+.mine:  push eax
         push bx
         cmp dx, 20h
         je .pic
@@ -2573,6 +2754,44 @@ sb_trap:
         mov al, [cs:sb_tmp]
         retf
 
+; A program that ends (INT 21h AH 00h / 4Ch) while its sound plays (auto-init DMA) would
+; leave the emulated card playing its buffer: the card is reset when the program that last
+; wrote to it ends (its PSP from the DOS swappable data area). In Windows 386 enhanced mode
+; the VxD does the same in its MS-DOS boxes.
+sb_psp          dw 0
+sb_sda          dd 0
+old21a          dd 0
+int21a:
+        cmp ah, 4Ch
+        je .end
+        test ah, ah
+        jz .end
+.chain: jmp far [cs:old21a]
+.end:   cmp byte [cs:handover], 0
+        jne .chain
+        test byte [cs:SB_FLAGS], SBF_ON
+        jz .chain
+        push ds
+        push bx
+        lds bx, [cs:sb_sda]
+        mov bx, [bx+10h]                ; the current PSP
+        cmp bx, [cs:sb_psp]
+        pop bx
+        pop ds
+        jne .chain
+        push ax
+        push cx
+        push dx
+        mov word [cs:sb_psp], 0
+        mov dx, 0FFFFh                  ; reset the emulated card
+        mov cl, 4
+        xor al, al
+        call sb_core
+        pop dx
+        pop cx
+        pop ax
+        jmp .chain
+
 ; the core: DX = port, AL = data, CL bit 2 = output; AL = result
 sb_core:
         push ebx
@@ -2586,7 +2805,16 @@ sb_core:
         push fs
         push gs
         mov [cs:sb_out], al
-        mov [cs:sb_ss], ss
+        test cl, 4
+        jz .nopsp
+        cmp dx, 0FFFFh
+        je .nopsp
+        push ds
+        lds bx, [cs:sb_sda]             ; the program that writes to the card
+        mov bx, [bx+10h]
+        mov [cs:sb_psp], bx
+        pop ds
+.nopsp: mov [cs:sb_ss], ss
         mov [cs:sb_sp], sp
         push cs
         pop ss
@@ -2807,6 +3035,7 @@ sb_deliver:
         mov byte [cs:SB_INIRQ], 1
         mov byte [cs:SB_PIC], 0
         mov dx, 20h
+        bts word [cs:sb_mine], dx
         mov ax, 1A09h
         call far [cs:SB_QPI]
         xor bx, bx
@@ -2816,8 +3045,12 @@ sb_deliver:
         pushf
         call far [bx]
         mov dx, 20h
+        btr word [cs:sb_mine], dx
+        bt word [cs:sb_pmap], dx
+        jc .ptrap
         mov ax, 1A0Ah
         call far [cs:SB_QPI]
+.ptrap:
         mov byte [cs:SB_INIRQ], 0
 .later: pop ds
         pop dx
@@ -2919,11 +3152,13 @@ vm_cbs:                                 ; DPMI real-mode callbacks
 ; character device EMMQXXX0 (VCPI without EMS, like EMM386 NOEMS): DOS extenders and Windows
 ; standard mode look for it before they ask INT 67h for VCPI. Put into the DOS device chain
 ; while the monitor runs.
+                align 16
 vm_emmhdr       dd -1
                 dw 0C000h               ; character device, IOCTL
                 dw vm_emmstrat
                 dw vm_emmint
-                db 'EMMQXXX0'
+                db 'EMMQXXX0'           ; EMMXXXX0 when the monitor offers expanded memory
+vm_emmiret:     iret                    ; INT 67h with expanded memory (the monitor serves it)
 vm_emmreq       dd 0
 vm_nulptr       dd 0                    ; the NUL device header
 vm_emmin        db 0                    ; EMMQXXX0 is in the device chain
@@ -3003,6 +3238,12 @@ vm_emmon:
         mov es, ax
         mov word [es:67h*4], vm_iret
         mov [es:67h*4+2], cs
+        test word [cs:VM_FLAGS], VMF_EMS
+        jz .p
+        mov ax, cs
+        add ax, (vm_emmhdr - $$) >> 4
+        mov word [es:67h*4], vm_emmiret - vm_emmhdr
+        mov [es:67h*4+2], ax
 .p:     pop eax
         pop bx
         pop es
@@ -3230,7 +3471,7 @@ xm_do           dd 0
 
 msg_banner      db BANNER, 13, 10, '$'
 msg_no386       db DRVNAME, ': 386 or later required', 13, 10, '$'
-msg_notsc       db DRVNAME, ': CPU without CPUID / time stamp counter (Pentium class or later required)', 13, 10, '$'
+msg_notsc       db DRVNAME, ': CPU without CPUID / time stamp counter (Pentium or later required)', 13, 10, '$'
 msg_noxms       db DRVNAME, ': XMS driver (HIMEM.SYS) not loaded', 13, 10, '$'
 msg_noemb       db DRVNAME, ': cannot allocate extended memory', 13, 10, '$'
 msg_nofile      db DRVNAME, ': cannot read $'
@@ -3264,14 +3505,21 @@ msg_sbp         db ' P$'
 msg_sbt         db ' T6', 13, 10, '$'
 msg_sbok1       db DRVNAME, ': DOS programs: $'
 msg_sbok2       db ' ports trapped (QPI), RTC interrupt 1024 Hz', 13, 10, '$'
-msg_sbemm       db DRVNAME, ': DOS programs: a memory manager without port trapping runs (EMM386?);', 13, 10
-                db DRVNAME, ':   without it this driver traps the ports itself, or use QEMM, or JEMM386 /', 13, 10
-                db DRVNAME, ':   JEMMEX with DEVICE=JLOAD.EXE QPIEMU.DLL (Windows MS-DOS boxes always', 13, 10
-                db DRVNAME, ':   have the emulation)', 13, 10, '$'
+msg_sbemm       db DRVNAME, ': DOS programs: no emulation, the memory manager (EMM386?)', 13, 10
+                db DRVNAME, ':   cannot trap ports for it. Without EMM386 this driver traps them', 13, 10
+                db DRVNAME, ':   itself and gives EMS, VCPI and DPMI; or QEMM 7.03+, or JEMM386 /', 13, 10
+                db DRVNAME, ':   JEMMEX with DEVICE=JLOAD.EXE QPIEMU.DLL. (Windows MS-DOS boxes', 13, 10
+                db DRVNAME, ':   always have the emulation.)', 13, 10, '$'
 msg_sbnov86     db DRVNAME, ': DOS programs: no emulation (/NOV86)', 13, 10, '$'
+msg_sbqold      db DRVNAME, ': DOS programs: no emulation, QEMM before 7.03 cannot trap ports', 13, 10
+                db DRVNAME, ':   for it (its QPI has no I/O trapping): update QEMM, or use JEMM386', 13, 10
+                db DRVNAME, ':   / JEMMEX with QPIEMU.DLL, or no memory manager. (Windows MS-DOS', 13, 10
+                db DRVNAME, ':   boxes always have the emulation.)', 13, 10, '$'
+qpi_old         db 0                    ; QEMM's QPI found, but before 7.03
 msg_vmfail      db DRVNAME, ': DOS programs: the V86 monitor could not start', 13, 10, '$'
-msg_vmon        db DRVNAME, ': DOS programs: ports trapped by the built-in V86 monitor, VCPI and DPMI', 13, 10
-                db DRVNAME, ':   available, RTC interrupt 1024 Hz', 13, 10, '$'
+msg_ems         db DRVNAME, ': DOS programs: expanded memory (EMS 4.0) from the V86 monitor', 13, 10, '$'
+msg_vmon        db DRVNAME, ': DOS programs: ports trapped by the built-in V86 monitor,', 13, 10
+                db DRVNAME, ':   VCPI and DPMI available, RTC interrupt 1024 Hz', 13, 10, '$'
 msg_sbbusy      db DRVNAME, ': DOS programs: another program traps ports through the QPI (SBEMU?),', 13, 10
                 db DRVNAME, ':   no emulation in DOS', 13, 10, '$'
 msg_sboff       db DRVNAME, ': Sound Blaster emulation off (/NOSB)', 13, 10, '$'
@@ -3280,6 +3528,8 @@ pagetab16       db 8Bh, 89h, 8Ah
 
 ; AX -> hex, DX not changed
 print_hex:
+        cmp byte [cs:quiet], 0
+        jne .r
         push ax
         push bx
         push cx
@@ -3308,10 +3558,12 @@ print_hex:
         pop cx
         pop bx
         pop ax
-        ret
+.r:     ret
 
 ; AX -> decimal
 print_dec:
+        cmp byte [cs:quiet], 0
+        jne .rq
         push ax
         push bx
         push cx
@@ -3333,7 +3585,7 @@ print_dec:
         pop cx
         pop bx
         pop ax
-        ret
+.rq:    ret
 
 ; the QPI entry of QEMM (QEMM386$ IOCTL) or of JEMM's QPIEMU (INT 2Fh 1684h, 4354h)
 qpi_find:
@@ -3376,12 +3628,29 @@ qpi_find:
         xor bx, bx
         call far [SB_QPI]
         jc .none
-        cmp bx, 0703h
-        jb .none
-        clc
+        cmp bx, 0703h                   ; port trapping (functions 1Axxh) since QEMM 7.03
+        jae .ok
+        mov byte [qpi_old], 1
+        jmp .none
+.ok:    clc
         ret
 .none:  mov dword [SB_QPI], 0
         stc
+        ret
+
+; DX = port: NC when it is a mode or mask register (all channels of a DMA controller)
+sb_shared:
+        cmp dx, 0Ah
+        je .y
+        cmp dx, 0Bh
+        je .y
+        cmp dx, 0D4h
+        je .y
+        cmp dx, 0D6h
+        je .y
+        stc
+        ret
+.y:     clc
         ret
 
 ; SI -> next free entry of sb_ports: AX = port
@@ -3398,6 +3667,20 @@ sb_init:
         ret
 .on:    test byte [SB_FLAGS], SBF_ON
         jz .x
+        ; the end of a program resets the emulated card (int21a)
+        push es
+        push bx
+        mov ah, 34h                     ; InDOS at SDA + 1
+        int 21h
+        dec bx
+        mov [sb_sda], bx
+        mov [sb_sda+2], es
+        pop bx
+        pop es
+        mov al, 21h
+        mov di, old21a
+        mov dx, int21a
+        call hook
         ; summary: the BLASTER variable for the programs
         mov dx, msg_sb1
         call print
@@ -3437,7 +3720,10 @@ sb_init:
         jnc .qpi
         ; no QPI: the built-in V86 monitor, when DOS runs in real mode
         mov dx, msg_sbemm
-        cmp byte [vcpi_ok], 0
+        cmp byte [qpi_old], 0
+        je .qnew
+        mov dx, msg_sbqold
+.qnew:  cmp byte [vcpi_ok], 0
         jne .noqpi
         mov dx, msg_sbnov86
         test word [VM_FLAGS], VMF_NOV86
@@ -3448,12 +3734,20 @@ sb_init:
 .noqpi: call print
         ret
 .qpi:   push es
-        mov ax, 1A06h                   ; someone else's trap callback?
+        mov ax, 1A06h                   ; the callback before (QEMM 7.5 has its own)
         call far [SB_QPI]
-        mov ax, es
+        mov [qpi_prev], di
+        mov [qpi_prev+2], es
         pop es
-        or ax, di
+        cmp dword [qpi_prev], 0
+        je .free
+        mov dx, [SB_BASE]               ; the card's ports trapped already: another
+        mov ax, 1A08h                   ; emulator (SBEMU?)
+        call far [SB_QPI]
+        jc .free
+        test bl, bl
         jz .free
+        mov dword [qpi_prev], 0
         mov dx, msg_sbbusy
         call print
         ret
@@ -3524,6 +3818,21 @@ sb_init:
 .trap:  mov dx, [si]
         test dx, dx
         jz .trapped
+        cmp dword [qpi_prev], 0
+        je .tm
+        push dx
+        mov ax, 1A08h                   ; trapped by QEMM itself (its DMA translation)?
+        call far [SB_QPI]
+        pop dx
+        jc .tm
+        test bl, bl
+        jz .tm
+        bts word [sb_pmap], dx
+        call sb_shared                  ; mode / mask register of all channels: QEMM keeps
+        jc .tm                          ; it (else floppy transfers fail), the core assumes
+        or byte [SB_XFLAGS], SBX_NOMODE ; auto-init and unmasked for the card's channel
+        jmp .tn
+.tm:    bts word [sb_mine], dx
         mov ax, 1A09h
         call far [SB_QPI]
         jc .tn
@@ -3582,7 +3891,21 @@ vm_start:
         mov word [VM_OIRET], vm_iret
         mov word [VM_OVMON], vm_on
         mov byte [VM_NCBF], VM_NCB
-        mov eax, 1                      ; CPU family for DPMI
+        mov al, 5                       ; CPU family for DPMI (no CPUID: a Pentium class SoC)
+        pushfd
+        pop ecx
+        mov edx, ecx
+        xor ecx, 200000h
+        push ecx
+        popfd
+        pushfd
+        pop ecx
+        push edx
+        popfd
+        xor ecx, edx
+        test ecx, 200000h
+        jz .fam
+        mov eax, 1
         cpuid
         shr eax, 8
         and al, 0Fh
@@ -3618,6 +3941,25 @@ vm_start:
         call vm_emmon
         mov dx, msg_vmon
         call print
+        ; expanded memory of the monitor: its device is EMMXXXX0 (the way programs find an
+        ; expanded memory manager), INT 67h points into the paragraph of that device
+        ; header (the other way: the name at offset 0Ah of the vector's segment)
+        test word [VM_FLAGS], VMF_EMS
+        jz .noems
+        mov dword [vm_emmhdr+10], 'EMMX'
+        mov dword [vm_emmhdr+14], 'XXX0'
+        push es
+        xor ax, ax
+        mov es, ax
+        mov ax, cs
+        add ax, (vm_emmhdr - $$) >> 4
+        mov word [es:67h*4], vm_emmiret - vm_emmhdr
+        mov [es:67h*4+2], ax
+        pop es
+        mov byte [vm_i67], 1            ; ours while the monitor runs (not for Windows)
+        mov dx, msg_ems
+        call print
+.noems:
         clc
         ret
 .fail:  stc
@@ -3660,7 +4002,25 @@ vm_vdesc        dw 0FFFFh, 0, 9A00h, 00CFh      ; code: base 0, 4 GB, 32-bit, ri
                 dw 0FFFFh, 0, 9200h, 00CFh
 %endif
 
-print:  push ax
+; print the '$'-terminated message at CS:DX. /Q: only the error messages (the first one
+; turns the quiet mode off, so that its details follow)
+print:  cmp byte [cs:quiet], 0
+        je .p
+        cmp dx, msg_no386
+        jb .q
+        cmp dx, msg_units1
+        jb .err
+        cmp dx, msg_nodisk
+        je .err
+%ifdef PKG_AUDIO
+        cmp dx, msg_nosnd
+        je .err
+        cmp dx, msg_vmfail
+        je .err
+%endif
+.q:     ret
+.err:   mov byte [cs:quiet], 0
+.p:     push ax
         push ds
         push cs
         pop ds
@@ -3669,6 +4029,7 @@ print:  push ax
         pop ds
         pop ax
         ret
+quiet   db 0                            ; /Q
 
 
 do_init:
@@ -3676,11 +4037,9 @@ do_init:
         pop ds
         mov [rm_seg], cs
         mov [cb+CB_DRVSEG], cs
-        mov dx, msg_banner
-        call print
         ; CB defaults
         mov dword [cb+CB_MAGIC], 42433357h
-        mov word [cb+4], 0110h
+        mov word [cb+4], 0120h
         mov word [cb+6], 2048
         mov al, [mplex]
         mov [cb+CB_MPLEX], al
@@ -3710,6 +4069,8 @@ do_init:
         mov [cb+CB_CBLIN], eax
 
         call parse_cmdline
+        mov dx, msg_banner
+        call print
 %ifndef PKG_DISK
         or word [cb+CB_OPTS], OPT_USB   ; core in DOS and standard mode unless /WIN
         test word [cb+CB_OPTS], OPT_WINONLY
@@ -3747,12 +4108,12 @@ do_init:
         popfd
         xor eax, ecx
         test eax, 200000h
-        jz .notsc
+        jz .probe                       ; no CPUID (Vortex86 DX / MX): try the TSC itself
         mov eax, 1
         cpuid
         test dl, 10h
         jnz .tscok
-        call tsc_probe                  ; CPUs that have a TSC without the CPUID flag (Vortex86)
+.probe: call tsc_probe                  ; CPUs that have a TSC without CPUID or its flag (Vortex86)
         jnc .tscok
 .notsc: mov dx, msg_notsc
         call print
@@ -3836,6 +4197,9 @@ do_init:
         call callcore
         jmp .fwloop
 .fwdone:
+%endif
+%ifndef PKG_DISK
+        call load_vols
 %endif
 %ifndef PKG_AUDIO
         ; the BIOS disks on controllers the core took over: their INT 13h is served here
@@ -3938,6 +4302,25 @@ do_init:
         call hook_irqs                  ; before INT 08h can poll (INTx goes on at the first poll)
         mov dx, msg_usb
         call print
+%ifdef PKG_USB
+        ; a controller without its own interrupt: the RTC polls it too
+        xor esi, esi
+.pc:    cmp word [cb+CB_HCBDF+esi*2], 0
+        je .pn
+        cmp byte [cb+CB_HCIRQ+esi], 0FFh
+        je .prtc
+.pn:    inc esi
+        cmp esi, 8
+        jb .pc
+        jmp .nortc
+.prtc:  mov al, 70h
+        mov di, old70u
+        mov dx, int70u
+        call hook
+        mov byte [usb_rtcwant], 1
+        call usb_rtc_on
+.nortc:
+%endif
         mov al, 08h
         mov di, old08
         mov dx, int08
@@ -4309,7 +4692,26 @@ parse_cmdline:
         jne .nsb3
         or byte [SB_FLAGS], SBF_NOMPU
         jmp .o
-.nsb3:  mov bx, vmoptab                 ; /NOV86 /NODPMI /NOVCPI /NOVME
+.nsb3:  cmp dword [tok], 'EMS:'          ; /EMS:n  expanded memory, MB
+        jne .nems
+        push si
+        mov si, tok+4
+        xor ax, ax
+.ed:    mov dl, [si]
+        sub dl, '0'
+        cmp dl, 9
+        ja .ee
+        mov dh, 10
+        mul dh
+        add al, dl
+        inc si
+        cmp ax, 64
+        jb .ed
+        mov al, 64
+.ee:    mov [VM_EMSMB], al
+        pop si
+        jmp .o
+.nems:  mov bx, vmoptab                 ; /NOV86 /NODPMI /NOVCPI /NOVME
 .vo:    mov dx, [bx]
         test dx, dx
         jz .nvm
@@ -4337,7 +4739,41 @@ parse_cmdline:
         jmp .vo
 .nvm:
 %endif
-        cmp word [tok], 'R:'
+%ifdef PKG_USB
+        cmp dword [tok], 'SPEE'         ; /SPEED:n  pointer speed, 25..400 percent
+        jne .nspd
+        cmp word [tok+4], 'D:'
+        jne .nspd
+        push si
+        mov si, tok+6
+        xor ax, ax
+.sd:    movzx dx, byte [si]
+        sub dl, '0'
+        cmp dl, 9
+        ja .se
+        imul ax, ax, 10
+        add ax, dx
+        inc si
+        cmp ax, 1000
+        jb .sd
+.se:    cmp ax, 25
+        jae .s1
+        mov ax, 25
+.s1:    cmp ax, 400
+        jbe .s2
+        mov ax, 400
+.s2:    shr ax, 1
+        mov [cb+WIN_DOSOFF+5], al
+        pop si
+        jmp .o
+.nspd:
+%endif
+        cmp word [tok], 'Q'             ; /Q: quiet, only errors on the screen
+        jne .nq
+        mov byte [quiet], 1
+        or byte [cb+CB_FLAGS+2], CBF_QUIET >> 16
+        jmp .o
+.nq:    cmp word [tok], 'R:'
         jne .tab
         mov al, [tok+2]
         sub al, '0'
@@ -4441,6 +4877,8 @@ vmoptab dw VMF_NOV86
         db 'VCPI', 0
         dw VMF_USEVME
         db 'VME', 0
+        dw VMF_NOEMS
+        db 'NOEMS', 0
         dw 0
 %endif
 opt2pass db 0
@@ -4576,6 +5014,77 @@ vcpi_detect:
 .no:    stc
         ret
 
+; XMS allocation (like function 09h: DX = KB -> AX = 1, DX = handle), above 16 MB when
+; there is room there: Windows 3.x standard mode (and other 286 DOS extenders) can use only
+; the extended memory below 16 MB, which the drivers should not take. The XMS driver gives
+; the lowest free block that fits: a block filling the free memory below 16 MB, allocated
+; first and freed after, pushes ours above it.
+xah_kb          dw 0
+xah_fill        dw 0
+xms_alloc_high:
+        push bx
+        push cx
+        mov [xah_kb], dx
+        mov word [xah_fill], 0
+        mov ah, 09h                     ; where would it go?
+        call far [xmsentry]
+        cmp ax, 1
+        jne .plain
+        push dx
+        mov ah, 0Ch
+        call far [xmsentry]
+        pop cx                          ; CX = handle
+        cmp ax, 1
+        jne .keep
+        push dx
+        push bx
+        mov dx, cx
+        mov ah, 0Dh
+        call far [xmsentry]
+        pop bx
+        pop dx                          ; DX:BX = physical address
+        cmp dx, 0100h
+        jae .keep                       ; above 16 MB already
+        ; KB from there to 16 MB
+        mov ax, 0100h
+        sub ax, dx
+        shl ax, 6                       ; 64 KB units -> KB
+        shr bx, 10
+        sub ax, bx
+        mov [xah_fill], ax
+        mov dx, cx
+        mov ah, 0Ah
+        call far [xmsentry]
+        mov dx, [xah_fill]
+        mov ah, 09h
+        call far [xmsentry]
+        cmp ax, 1
+        jne .plain0
+        mov [xah_fill], dx
+        mov dx, [xah_kb]
+        mov ah, 09h
+        call far [xmsentry]
+        push ax
+        push dx
+        mov dx, [xah_fill]              ; the filler goes again
+        mov ah, 0Ah
+        call far [xmsentry]
+        pop dx
+        pop ax
+        cmp ax, 1
+        je .ret
+.plain0:
+        mov word [xah_fill], 0
+.plain: mov dx, [xah_kb]
+        mov ah, 09h
+        call far [xmsentry]
+        jmp .ret
+.keep:  mov dx, cx
+        mov ax, 1
+.ret:   pop cx
+        pop bx
+        ret
+
 ; XMS move of xm_len bytes from conventional ESI(seg:off) to EMB offset EDI
 xms_to_emb:
         mov [xm_len], ecx
@@ -4594,12 +5103,42 @@ xms_to_emb:
 .e:     stc
         ret
 
+; The init buffer: the memory after the driver's image while INIT runs (file pieces, page
+; tables). DOS 5 and later say where the memory given to the driver ends (INIT request,
+; offset 0Eh): an upper memory block of DEVICEHIGH may end only a little after the image,
+; and writing past it destroyed what follows (a crash at the start with JEMM386's small
+; UMBs). Then the 4 KB of mbrbuf (inside the image, used only after the core started)
+; serve, in pieces of 4 KB.
+ibuf            dw initbuf
+ichunk          dw 4000h
+init_room:
+        push es
+        push bx
+        les bx, [reqptr]
+        movzx eax, word [es:bx+10h]     ; end of the memory for the driver
+        shl eax, 4
+        movzx edx, word [es:bx+0Eh]
+        add eax, edx
+        pop bx
+        pop es
+        movzx edx, word [rm_seg]
+        shl edx, 4
+        add edx, initbuf
+        cmp eax, edx
+        jbe .x                          ; not given (DOS 4, DEVLOAD): the memory is there
+        sub eax, edx
+        cmp eax, 4000h + 16
+        jae .x
+        mov word [ibuf], mbrbuf
+        mov word [ichunk], 1000h
+.x:     ret
+
 ; clear the init buffer (BX = bytes)
 clrbuf:
         push es
         push cs
         pop es
-        mov di, initbuf
+        mov di, [ibuf]
         mov cx, bx
         xor al, al
         rep stosb
@@ -4609,7 +5148,7 @@ clrbuf:
 ; buffer far pointer for XMS moves
 bufptr: mov esi, cs
         shl esi, 16
-        mov si, initbuf
+        mov si, [ibuf]
         ret
 
 %ifdef PKG_USB
@@ -4698,8 +5237,7 @@ load_fw:
         add eax, 2000h - 1
         shr eax, 10
         mov dx, ax
-        mov ah, 09h
-        call far [xmsentry]
+        call xms_alloc_high
         cmp ax, 1
         jne .close
         mov [fwemb], dx
@@ -4720,8 +5258,8 @@ load_fw:
         mov edi, [fwoff]
 .rd:    mov bx, [fhandle]
         mov ah, 3Fh
-        mov cx, 4000h
-        mov dx, initbuf
+        mov cx, [ichunk]
+        mov dx, [ibuf]
         int 21h
         jc .unlock
         test ax, ax
@@ -4808,6 +5346,7 @@ free_fw:
 %endif
 
 load_core:
+        call init_room
         mov dx, pathbuf
         mov ax, 3D00h
         int 21h
@@ -4823,23 +5362,26 @@ load_core:
         mov bx, ax
         mov ah, 3Fh
         mov cx, 64
-        mov dx, initbuf
+        mov dx, [ibuf]
         int 21h
         jc .nofile
         cmp ax, 64
         jne .bad
-        cmp dword [initbuf], 49433357h          ; 'W3CI'
+        mov bx, [ibuf]
+        cmp dword [bx], 49433357h               ; 'W3CI'
         jne .bad
-        cmp dword [initbuf+4], 80004000h
+        cmp dword [bx+4], 80004000h
         jne .bad
-        mov eax, [initbuf+8]
+        mov eax, [bx+8]
         sub eax, 80004000h
         mov [filesize], eax
-        mov eax, [initbuf+12]
+        mov eax, [bx+12]
         sub eax, 80004000h
         mov [imgtotal], eax
+        mov eax, [bx+44]
+        mov [core_stack], eax
         ; core entry points and stack
-        mov si, initbuf+16              ; +16..+40: functions 0-6
+        lea si, [bx+16]                 ; +16..+40: functions 0-6
         mov di, corefn
         mov cx, 7
 .cf:    mov eax, [si]
@@ -4847,15 +5389,14 @@ load_core:
         add si, 4
         add di, 4
         loop .cf
-        mov si, initbuf+48              ; +48..+60: functions 7-10 (+44 is the stack)
+        mov si, [ibuf]
+        add si, 48                      ; +48..+60: functions 7-10 (+44 is the stack)
         mov cx, 4
 .cf2:   mov eax, [si]
         mov [di], eax
         add si, 4
         add di, 4
         loop .cf2
-        mov eax, [initbuf+44]
-        mov [core_stack], eax
         ; EMB: tables (16K) + image + pool + 4K alignment slack
         mov eax, [imgtotal]
         add eax, 4000h + 0FFFh
@@ -4865,8 +5406,7 @@ load_core:
         shr eax, 10
         mov [emb_kb], ax
         mov dx, ax
-        mov ah, 09h
-        call far [xmsentry]
+        call xms_alloc_high
         cmp ax, 1
         jne .noemb
         mov [emb_handle], dx
@@ -4892,8 +5432,8 @@ load_core:
         add edi, 4000h
 .rd:    mov bx, [fhandle]
         mov ah, 3Fh
-        mov cx, 4000h
-        mov dx, initbuf
+        mov cx, [ichunk]
+        mov dx, [ibuf]
         int 21h
         jc .nofile
         test ax, ax
@@ -4912,7 +5452,7 @@ load_core:
         jmp .rd
 .eof:   call close_core
         ; zero bss and stack
-        mov bx, 4000h
+        mov bx, [ichunk]
         call clrbuf
         mov edi, [emb_off]
         add edi, 4000h
@@ -4925,9 +5465,10 @@ load_core:
         jae .zd
         mov ecx, edx
         sub ecx, edi
-        cmp ecx, 4000h
+        movzx eax, word [ichunk]
+        cmp ecx, eax
         jbe .zl
-        mov ecx, 4000h
+        mov ecx, eax
 .zl:    inc ecx
         and ecx, 0FFFFFFFEh
         push edi
@@ -5109,6 +5650,80 @@ tsc_probe:
         stc
         ret
 
+%ifndef PKG_DISK
+; The saved mixer settings (AUDTEST MIX writes them): <driver directory>\WINAUDIO.VOL
+; (WINUSB.VOL for the USB Audio devices of WINUSB), an array of struct winvolrec the core
+; takes with WINF_AUD_VOLS
+%ifdef PKG_AUDIO
+volname         db 'WINAUDIO.VOL', 0
+%else
+volname         db 'WINUSB.VOL', 0
+%endif
+volreq          times 32 db 0
+load_vols:
+        push es
+        pushad
+        push cs
+        pop es
+        ; the directory of the core file (pathbuf) + volname, in the init buffer
+        mov bp, [ibuf]
+        xor si, si
+        xor bx, bx
+.d:     mov al, [pathbuf+si]
+        test al, al
+        jz .de
+        mov [ds:bp+si], al
+        inc si
+        cmp al, '\'
+        je .ds
+        cmp al, ':'
+        jne .d
+.ds:    mov bx, si
+        jmp .d
+.de:    mov di, bx
+        mov si, volname
+.n:     lodsb
+        mov [ds:bp+di], al
+        inc di
+        test al, al
+        jnz .n
+        mov dx, bp
+        mov ax, 3D00h
+        int 21h
+        jc .x
+        mov bx, ax
+        mov ah, 3Fh
+        mov cx, 16 * 32
+        lea dx, [bp+128]
+        int 21h
+        pushf
+        push ax
+        mov ah, 3Eh
+        int 21h
+        pop cx
+        popf
+        jc .x
+        cmp cx, 32
+        jb .x
+        mov word [volreq], WINF_AUD_VOLS
+        mov word [volreq+2], 0FFFFh
+        mov dword [volreq+4], 1
+        movzx ecx, cx
+        mov [volreq+16], ecx
+        mov ax, cs
+        shl eax, 16
+        lea ax, [bp+128]
+        mov [volreq+24], eax
+        movzx ebx, word [rm_seg]
+        shl ebx, 4
+        add ebx, volreq
+        mov eax, FN_API
+        call callcore
+.x:     popad
+        pop es
+        ret
+%endif
+
 ; close the core file if it is open (a TSR must not keep handles of its own)
 close_core:
         cmp word [fhandle], 0FFFFh
@@ -5229,7 +5844,7 @@ setup_pm:
         push es
         push cs
         pop es
-        mov di, initbuf
+        mov di, [ibuf]
         mov si, gdt+SEL_VCPI
         mov ax, 0DE01h
         int 67h
@@ -5240,7 +5855,8 @@ setup_pm:
         or word [cb+CB_FLAGS], CBF_VCPI
         ; the HMA (100000h-10FFFFh) as it is: a server emulating A20 by paging may have it
         ; wrapped to 0-FFFFh at this moment, and DOS=HIGH keeps its buffers there
-        mov di, initbuf + 256*4
+        mov di, [ibuf]
+        add di, 256*4
         mov eax, 100000h
         mov cx, 16
 .hma:   mov edx, [di]
@@ -5253,7 +5869,7 @@ setup_pm:
         loop .hma
         jmp .pt0
 .ident: xor eax, eax
-        mov di, initbuf
+        mov di, [ibuf]
         mov cx, 1024
 .i:     mov edx, eax
         or edx, 7
@@ -5271,7 +5887,7 @@ setup_pm:
         mov bx, 4096
         call clrbuf
         mov eax, [pd_phys]
-        mov di, initbuf
+        mov di, [ibuf]
         mov edx, [coresize]
         add edx, CORE_POOL
         shr edx, 12
@@ -5301,15 +5917,16 @@ setup_pm:
         call xms_to_emb
         jc .fail
         ; page directory
+        mov bx, [ibuf]
         mov eax, [pd_phys]
         add eax, 1007h
-        mov [initbuf], eax
+        mov [bx], eax
         mov eax, [pd_phys]
         add eax, 2003h
-        mov [initbuf+512*4], eax
+        mov [bx+512*4], eax
         mov eax, [pd_phys]
         add eax, 3003h
-        mov [initbuf+768*4], eax
+        mov [bx+768*4], eax
         mov edi, [emb_off]
         mov ecx, 4096
         call bufptr
@@ -5477,6 +6094,8 @@ read_bds:
         ret
 
 show_units:
+        cmp byte [quiet], 0
+        jne .x
         mov dx, msg_units1
         call print
         movzx cx, byte [cb+CB_NUNITS]
@@ -5494,7 +6113,7 @@ show_units:
         loop .l
         mov dx, msg_crlf
         call print
-        ret
+.x:     ret
 
         align 16
 mbrbuf:         times 8 * 512 db 0

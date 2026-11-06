@@ -1,5 +1,8 @@
 ; winmouse.asm - WINMOUSE.DRV: Windows 3.x and 95/98/ME mouse driver for USB and PS/2 mice
 ; with wheel, back / forward buttons and autoscroll support
+; OLDWIN: WINMOU12.DRV, the same driver for Windows 1.x/2.x (real mode; linked into
+;   WIN100.BIN / WIN200.BIN by INSTUSB): no GetWinFlags (Windows 3.0), and USER's
+;   PostMessage / keybd_event are not used (no WINWHEEL there, keybd_event is Windows 3.0).
 ;
 ; 386 enhanced mode (and Windows 95/98/ME): WINUSB.386 / WINUSB.VXD calls MouseCallback through
 ;   nested execution with AX = delta X, BX = delta Y, CL = buttons, CH = previous buttons,
@@ -23,7 +26,9 @@ group DGROUP _DATA
 
 extern GetModuleHandle
 extern GetProcAddress
+%ifndef OLDWIN
 extern GetWinFlags
+%endif
 
 extern GetVersion
 
@@ -365,7 +370,11 @@ BiosCallback:
 mbox_setup:
         push es
         push di
+%ifdef OLDWIN
+        xor ax, ax                      ; Windows 1.x/2.x: real mode
+%else
         call far GetWinFlags
+%endif
         test al, 1                      ; WF_PMODE
         jnz .pm
         mov ax, WIN_MPLEX * 256          ; real mode (Windows 3.0 WIN /R): call it directly
@@ -704,6 +713,9 @@ SetWheelWindow:
 
 ; USER.PostMessage and USER.keybd_event (DS = DGROUP)
 resolve_user:
+%ifdef OLDWIN
+        ret
+%endif
         push ax
         push bx
         push cx
@@ -1256,40 +1268,41 @@ Irq12Direct:
         xor si, si
         cmp byte [pktneed], 4
         jne .now
-        mov al, [pkt+3]
+        mov dl, [pkt+3]                 ; (AX holds the X motion)
         cmp byte [imex], 0
         jne .imex
-        movsx dx, al
+        movsx dx, dl
         neg dx                          ; positive = away from the user
         jmp .now
 .imex:  ; IntelliMouse Explorer: bits 7-6 = 10b 6-bit wheel, 01b 6-bit tilt, else 4-bit wheel
         ; and buttons 4 (bit 4) and 5 (bit 5)
-        mov ah, al
-        and ah, 0C0h
-        cmp ah, 80h
+        mov dh, dl
+        and dh, 0C0h
+        cmp dh, 80h
         je .v6
-        cmp ah, 40h
+        cmp dh, 40h
         je .h6
-        test al, 10h
+        test dl, 10h
         jz .nb4
         or cl, 08h
-.nb4:   test al, 20h
+.nb4:   test dl, 20h
         jz .nb5
         or cl, 10h
-.nb5:   shl al, 4
-        sar al, 4
-        movsx dx, al
+.nb5:   shl dl, 4
+        sar dl, 4
+        movsx dx, dl
         neg dx
         jmp .now
-.v6:    shl al, 2
-        sar al, 2
-        movsx dx, al
+.v6:    shl dl, 2
+        sar dl, 2
+        movsx dx, dl
         neg dx
         jmp .now
-.h6:    shl al, 2
-        sar al, 2
-        movsx si, al
+.h6:    shl dl, 2
+        sar dl, 2
+        movsx si, dl
         neg si                          ; positive = right
+        xor dx, dx
 .now:   call deliver
         jmp .more
 .eoi:   mov al, 20h

@@ -8,9 +8,11 @@
      XButtons=1         back / forward buttons type Alt+Left / Alt+Right
      AutoScroll=1       wheel click in a window with scroll bars starts autoscroll
      AutoScrollSpeed=100   percent
-     NoAutoScroll=...   window classes that get the middle button themselves (comma separated) */
+     NoAutoScroll=...   window classes that get the middle button themselves (comma separated)
+     MouseSpeed=100     pointer speed of the USB mice and touchpads, percent (set by USBTREE) */
 #include <windows.h>
 #include <string.h>
+#include "winapi.h"
 
 #define WM_WINWHEEL   (WM_USER + 0x3D3)
 #define WM_WINTILT    (WM_USER + 0x3D4)
@@ -361,6 +363,74 @@ LRESULT CALLBACK _export WheelWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProc(hwnd, msg, wp, lp);
 }
 
+DWORD WINAPI GlobalDosAlloc(DWORD cb);
+UINT WINAPI GlobalDosFree(UINT sel);
+
+/* the pointer speed USBTREE saved, to WINUSB (WINF_SETOPT 5): the VxD's protected-mode entry,
+   else a simulated real-mode INT 2Fh (DPMI) */
+static void set_speed(int pct)
+{
+    static struct {
+        DWORD edi, esi, ebp, rsv, ebx, edx, ecx, eax;
+        WORD flags, es, ds, fs, gs, ip, cs, sp, ss;
+    } rmc;
+    struct winapireq FAR *r;
+    DWORD mem, ent = 0;
+    WORD rseg, es_ = 0, di_ = 0, vid = WIN_VXD_USB;
+    if (pct < 25 || pct > 400 || !(GetWinFlags() & WF_PMODE)) return;
+    mem = GlobalDosAlloc(sizeof(struct winapireq));
+    if (!mem) return;
+    rseg = HIWORD(mem);
+    r = (struct winapireq FAR *)MAKELP(LOWORD(mem), 0);
+    _fmemset(r, 0, sizeof(*r));
+    r->fn = WINF_SETOPT;
+    r->status = 0xFFFF;
+    r->arg0 = 5;
+    r->arg1 = (DWORD)pct;
+    if (GetWinFlags() & WF_ENHANCED) {
+        _asm {
+            push es
+            push di
+            xor di, di
+            mov es, di
+            mov ax, 1684h
+            mov bx, vid
+            int 2Fh
+            mov es_, es
+            mov di_, di
+            pop di
+            pop es
+        }
+        ent = ((DWORD)es_ << 16) | di_;
+    }
+    if (ent) {
+        _asm {
+            mov ax, 3
+            mov cx, rseg
+            xor dx, dx
+            call dword ptr ent
+        }
+    } else {
+        _fmemset(&rmc, 0, sizeof(rmc));
+        rmc.eax = ((DWORD)WIN_MPLEX_USB << 8) | 1;
+        rmc.es = rseg;
+        _asm {
+            push es
+            push di
+            push ds
+            pop es
+            lea di, rmc
+            mov ax, 0300h
+            mov bx, 002Fh
+            xor cx, cx
+            int 31h
+            pop di
+            pop es
+        }
+    }
+    GlobalDosFree(LOWORD(mem));
+}
+
 int PASCAL WinMain(HINSTANCE hi, HINSTANCE hprev, LPSTR cmd, int show)
 {
     WNDCLASS wc;
@@ -391,6 +461,7 @@ int PASCAL WinMain(HINSTANCE hi, HINSTANCE hprev, LPSTR cmd, int show)
     if (as_speed < 10) as_speed = 10;
     if (as_speed > 1000) as_speed = 1000;
     GetProfileString("WinWheel", "NoAutoScroll", def_noauto, noauto, sizeof(noauto));
+    set_speed(GetProfileInt("WinWheel", "MouseSpeed", 0));
     hm = GetModuleHandle("MOUSE");
     setw = hm ? (SETWHEELPROC)GetProcAddress(hm, "SetWheelWindow") : NULL;
     if (!setw) {

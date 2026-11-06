@@ -358,7 +358,7 @@ static int choose_alt(struct ua *u, u8 *ifd, u8 *end, struct ualt *best, int dir
     u8 *p = ifd;
     int bestscore = -1;
     for (; p && p + 2 <= end && p[0]; p += p[0]) {
-        u8 *q, *ep = NULL, *fb = NULL, ch = 0, sub = 0, bits = 0, term = 0, eprate = 0, clk = 0;
+        u8 *q, *ep = NULL, *fb = NULL, ch = 0, sub = 0, bits = 0, term = 0, eprate = 0, clk = 0, gen = 0, ftype = 0;
         u32 rates[16], lo = 0, hi = 0, rate;
         int nr = 0, pcm = 0, score, i;
         if (p[1] != 4) continue;
@@ -366,6 +366,7 @@ static int choose_alt(struct ua *u, u8 *ifd, u8 *end, struct ualt *best, int dir
         if (p[3] == 0 || p[5] != 1 || p[6] != 2) continue;
         for (q = p + p[0]; q + 2 <= end && q[0] && q[1] != 4; q += q[0]) {
             if (q[1] == 0x24 && q[2] == 1) {
+                gen = 1;
                 term = q[3];
                 if (u->uac2) {
                     pcm = q[0] >= 10 && (q[6] & 1) && q[5] == 1;
@@ -374,6 +375,7 @@ static int choose_alt(struct ua *u, u8 *ifd, u8 *end, struct ualt *best, int dir
                     pcm = (q[5] | (q[6] << 8)) == 1;
                 }
             } else if (q[1] == 0x24 && q[2] == 2 && q[3] == 1) {
+                ftype = 1;
                 if (u->uac2) {
                     sub = q[4];
                     bits = q[5];
@@ -396,11 +398,17 @@ static int choose_alt(struct ua *u, u8 *ifd, u8 *end, struct ualt *best, int dir
                 eprate = q[3] & 1;
             }
         }
-        if (!pcm || !ep || !ch || (sub != 2 && sub != 3 && sub != 4)) continue;
-        if (((ep[2] & 0x80) != 0) != dir) continue;
+        /* some devices leave out the general descriptor (or give no format tag in it): a
+           type I format is PCM */
+        if (!pcm && ftype && (!gen || !u->uac2)) pcm = 1;
+        if (ep && ((ep[2] & 0x80) != 0) != dir) continue;
         if (u->uac2) nr = clock_rates(u, term, rates, 16, &clk);
         rate = pick_rate(rates, nr, lo, hi);
-        if (!rate) continue;
+        if (!pcm || !ep || !ch || (sub != 2 && sub != 3 && sub != 4) || !rate) {
+            kprintf("uaudio:   if %u alt %u not usable: format %u%s, %u ch, %u bytes, %lu Hz, %s\n", p[2], p[3],
+                    ftype, pcm ? " PCM" : "", ch, sub, rate, ep ? "endpoint" : "no isochronous endpoint");
+            continue;
+        }
         score = (ch == 2 ? 100 : ch > 2 ? 50 : 30) + (sub == 2 ? 20 : sub == 3 ? 15 : 10) +
                 (rate == 48000 ? 8 : rate == 44100 ? 6 : 2);
         if (score > bestscore) {
@@ -749,6 +757,7 @@ static int probe_midi(struct usb_dev *d, u8 *ifd, u8 *end)
     u->a.type = AT_USB;
     u->a.caps = WINAC_MIDI;
     u->a.midiout = 1;
+    u->a.usbid = d->id;
     adev_register(&u->a);
     if (d->driver == UD_NONE) d->driver = UD_MIDI;
     kprintf("uaudio: dev %u MIDI output on interface %u\n", d->id, ifd[2]);
@@ -791,7 +800,10 @@ static int ua_probe(struct usb_dev *d, u8 *ifd, u8 *end)
             got |= 2;
         }
     }
-    if (!got) return -1;
+    if (!got) {
+        kprintf("uaudio: dev %u: no stream it can play or record\n", d->id);
+        return -1;
+    }
     u->used = 1;
     if (!u->rings) u->rings = kmalloc_align(RINGSZ * 2, 4096);
     if (!u->rings) return -1;
@@ -854,6 +866,7 @@ static int ua_probe(struct usb_dev *d, u8 *ifd, u8 *end)
     u->a.type = AT_USB;
     u->a.hwvol = (u8)(u->ofu != 0);
     u->a.midiout = 0;
+    u->a.usbid = d->id;
     name_dev(u, d, "");
     d->driver = UD_AUDIO;
     d->drvinfo = (u8)(u->uac2 ? 2 : 1);

@@ -79,6 +79,18 @@ void plat_screen(int on)
     scr_on = on;
 }
 
+/* DOS: AUDTEST writes them to WINAUDIO.VOL, WINAUDIO.SYS loads that file at the start */
+void plat_vol_saved(const void *recs, u32 len)
+{
+    (void)recs; (void)len;
+}
+
+/* DOS and Windows 3.x: /SPEED:n at the start, WINWHEEL.EXE sets the one USBTREE saved */
+void plat_mspeed_saved(u32 pct)
+{
+    (void)pct;
+}
+
 void plat_putc(char c)
 {
     if (c == '\n') plat_putc('\r');
@@ -455,6 +467,28 @@ void plat_aux_poll(void)
 {
     struct wincbx *x;
     u32 now, n, bad;
+    static u8 parked;
+    static u32 std_ms;
+    /* Windows standard mode: its own PS/2 mouse driver (MOUSE.DRV) takes the aux port; the
+       touchpad in our protocol would only give it garbage, and reprogramming the pad after
+       each of its resets keeps the 8042 busy (keyboard and mouse stop). Unless WINMOUSE.DRV
+       claims the pad within a few seconds, it goes back to its mouse mode until Windows
+       ends. */
+    if (cb->flags & CBF_WINSTD) {
+        if (!std_ms) std_ms = plat_ms() | 1;
+        if (!(cb->flags & (CBF_MBOX | CBF_AUXWIN)) && aux_state && plat_ms() - std_ms > 3000) {
+            kprintf("dos: Windows standard mode drives the PS/2 mouse, touchpad in its mouse mode\n");
+            aux_stop();
+            parked = 1;
+        }
+        if (parked && !(cb->flags & (CBF_MBOX | CBF_AUXWIN))) return;
+    } else {
+        std_ms = 0;
+    }
+    if (parked) {
+        parked = 0;
+        aux_start();
+    }
     if (!aux_state) return;
     x = cbx();
     plat_aux_irq();
@@ -553,6 +587,7 @@ void plat_mouse(int dx, int dy, int dz, int dw, int buttons)
 {
     (void)dw;
     if (cb->opts & OPT_NOKBC) return;
+    mouse_speed(&dx, &dy);
     if (dz && !(cb->wheel_ctl & 1))
         wheel_to_keys(dz);              /* scroll through the cursor keys (pre-wheel software) */
     m_dx += dx; m_dy += dy; m_dz += dz;
@@ -714,6 +749,10 @@ int plat_sb_start(void)
 /* port access: port | value << 16 | out << 24 */
 u32 __cdecl ent_sbio(u32 arg)
 {
+    if ((arg & 0xFFFF) == 0xFFFF) {         /* the program that used the card ended */
+        sb_reset_owner();
+        return 0xFFFFFFFFUL;
+    }
     return sb_io(arg & 0xFFFF, (arg >> 16) & 0xFF, (int)((arg >> 24) & 1));
 }
 

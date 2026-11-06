@@ -15,8 +15,12 @@
 #define ID_EJECT    102
 #define ID_LOG      103
 #define ID_SAVE     104
-#define ID_AUTO     105
-#define NBTN        5
+#define ID_SPEED    105
+#define ID_AUTO     106
+#define NBTN        6
+#define ID_SPBAR    101         /* mouse speed dialog: scroll bar, value */
+#define ID_SPVAL    102
+#define SPEED_DLG   3
 #define ID_LIST     200
 #define ID_TEXT     201
 #define ID_FNAME    100
@@ -546,6 +550,7 @@ static void show_details(void)
     HCURSOR oc = SetCursor(LoadCursor(NULL, IDC_WAIT));
     sb_init(&s, text, TEXTSZ);
     EnableWindow(hBtn[1], FALSE);
+    EnableWindow(hBtn[4], FALSE);
     if (sel < 0 || sel >= nvis) {
         if (!have_usb && !have_disk) sb_printf(&s, "WINUSB.SYS is not loaded.");
     } else if (vis[sel] == V_DISKS) {
@@ -561,6 +566,7 @@ static void show_details(void)
         } else {
             detail_dev(&s, n);
             EnableWindow(hBtn[1], (n->driver == UD_BOT || n->driver == UD_UAS) && !(n->portstatus & 0x00800000UL));
+            EnableWindow(hBtn[4], n->driver == UD_MOUSE && cur_mplex == WIN_MPLEX_USB);
         }
     }
     set_text();
@@ -721,7 +727,7 @@ static void layout(int w, int h)
     for (i = 0; i < NBTN; i++) {
         int bw;
         GetWindowText(hBtn[i], t, sizeof(t));
-        bw = LOWORD(GetTextExtent(dc, t, strlen(t))) + (i == NBTN - 1 ? 28 : 16);
+        bw = LOWORD(GetTextExtent(dc, t, strlen(t))) + (i == NBTN - 1 ? 24 : 12);
         MoveWindow(hBtn[i], x, 4, bw, btnh, TRUE);
         x += bw + 4;
     }
@@ -732,9 +738,98 @@ static void layout(int w, int h)
     MoveWindow(hText, lw + 8, btnh + 8, w - lw - 12, h - btnh - 12, TRUE);
 }
 
+/* ---- mouse speed: the pointer speed of all USB mice and touchpads (WINF_SETOPT 5), kept in
+   WIN.INI [WinWheel] MouseSpeed= (WINWHEEL.EXE sets it again when Windows starts) ---- */
+
+static int sp_old, sp_cur;
+
+static void sp_show(HWND dlg)
+{
+    char t[16];
+    SetScrollPos(GetDlgItem(dlg, ID_SPBAR), SB_CTL, sp_cur, TRUE);
+    wsprintf(t, "%d %%", sp_cur);
+    SetDlgItemText(dlg, ID_SPVAL, t);
+}
+
+static void sp_set(int pct)
+{
+    unsigned long r;
+    wincall(WINF_SETOPT, 5, (unsigned long)pct, 0, &r);
+}
+
+BOOL CALLBACK _export SpeedProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
+{
+    int v;
+    switch (msg) {
+    case WM_INITDIALOG:
+        SetScrollRange(GetDlgItem(dlg, ID_SPBAR), SB_CTL, 25, 400, FALSE);
+        sp_show(dlg);
+        return TRUE;
+    case WM_HSCROLL:
+        v = sp_cur;
+        switch (wp) {
+        case SB_LINELEFT: v -= 5; break;
+        case SB_LINERIGHT: v += 5; break;
+        case SB_PAGELEFT: v -= 25; break;
+        case SB_PAGERIGHT: v += 25; break;
+        case SB_LEFT: v = 25; break;
+        case SB_RIGHT: v = 400; break;
+        case SB_THUMBTRACK:
+        case SB_THUMBPOSITION: v = LOWORD(lp) / 5 * 5; break;
+        default: return TRUE;
+        }
+        if (v < 25) v = 25;
+        if (v > 400) v = 400;
+        if (v != sp_cur) {
+            sp_cur = v;
+            sp_show(dlg);
+            sp_set(sp_cur);         /* at once: the pointer can be tried while the box is open */
+        }
+        return TRUE;
+    case WM_COMMAND:
+        if (wp == IDOK || wp == IDCANCEL) {
+            if (wp == IDCANCEL) sp_cur = sp_old;
+            sp_set(sp_cur);
+            EndDialog(dlg, wp == IDOK);
+            return TRUE;
+        }
+        if (wp == 103) {            /* default */
+            sp_cur = 100;
+            sp_show(dlg);
+            sp_set(sp_cur);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
+static void mouse_speed(void)
+{
+    unsigned long r = 100;
+    unsigned char save = cur_mplex;
+    FARPROC fp;
+    char t[16];
+    cur_mplex = WIN_MPLEX_USB;
+    if (wincall(WINF_SETOPT, 5, 0xFFFFFFFFUL, 0, &r) != WINE_OK) {
+        cur_mplex = save;
+        MessageBox(hMain, "WINUSB does not answer.", "Mouse speed", MB_OK | MB_ICONSTOP);
+        return;
+    }
+    sp_old = sp_cur = r >= 25 && r <= 400 ? (int)r : 100;
+    fp = MakeProcInstance((FARPROC)SpeedProc, hInst);
+    if (DialogBox(hInst, MAKEINTRESOURCE(SPEED_DLG), hMain, (DLGPROC)fp) == 1) {
+        wsprintf(t, "%d", sp_cur);
+        WriteProfileString("WinWheel", "MouseSpeed", t);
+    }
+    FreeProcInstance(fp);
+    cur_mplex = save;
+}
+
 LRESULT CALLBACK _export MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
-    static const char *labels[NBTN] = { "&Refresh", "Safe &removal", "&Log", "&Save report...", "&Auto refresh" };
+    static const char *labels[NBTN] = { "&Refresh", "Safe &removal", "&Log", "&Save report...", "&Mouse speed...",
+                                        "&Auto refresh" };
     static int tabs[1] = { 64 };
     int i;
     switch (msg) {
@@ -757,6 +852,7 @@ LRESULT CALLBACK _export MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                              ES_AUTOVSCROLL, 0, 0, 10, 10, hwnd, (HMENU)ID_TEXT, hInst, NULL);
         SendMessage(hText, EM_SETTABSTOPS, 1, (LPARAM)(int FAR *)tabs);
         EnableWindow(hBtn[1], FALSE);
+        EnableWindow(hBtn[4], FALSE);
         SendMessage(hBtn[NBTN - 1], BM_SETCHECK, 1, 0);
         return 0;
     }
@@ -776,7 +872,7 @@ LRESULT CALLBACK _export MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         break;
     case WM_GETMINMAXINFO:
-        ((MINMAXINFO FAR *)lp)->ptMinTrackSize.x = 440;
+        ((MINMAXINFO FAR *)lp)->ptMinTrackSize.x = 540;
         ((MINMAXINFO FAR *)lp)->ptMinTrackSize.y = 240;
         return 0;
     case WM_SIZE:
@@ -791,6 +887,7 @@ LRESULT CALLBACK _export MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case ID_EJECT: eject(); return 0;
         case ID_LOG: show_log(); return 0;
         case ID_SAVE: save_report(); return 0;
+        case ID_SPEED: mouse_speed(); return 0;
         case ID_AUTO:
             if (SendMessage(hBtn[NBTN - 1], BM_GETCHECK, 0, 0)) {
                 if (!timer_id) timer_id = SetTimer(hwnd, 1, 2000, NULL);
@@ -841,7 +938,7 @@ int PASCAL WinMain(HINSTANCE hi, HINSTANCE hprev, LPSTR cmd, int show)
     vxd_ent[1] = vxd_find(WIN_VXD_DISK);
     have_usb = dos_sel && (windetect(WIN_MPLEX_USB) || vxd_ent[0]);
     have_disk = dos_sel && (windetect(WIN_MPLEX_DISK) || vxd_ent[1]);
-    w = cx - 40 > 760 ? 760 : cx - 40;
+    w = cx - 40 > 760 ? 760 : cx - 8;
     h = cy - 60 > 520 ? 520 : cy - 60;
     hMain = CreateWindow("WINUsbTree", "USB Tree - WINDRV", WS_OVERLAPPEDWINDOW, (cx - w) / 2, (cy - h) / 3, w, h,
                          NULL, NULL, hi, NULL);

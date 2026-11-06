@@ -22,7 +22,7 @@ WINPDR_DDB:
         dd 0                    ; next
         dw 0400h                ; SDK version
         dw 0                    ; device id: undefined
-        db 1, 1                 ; version 1.1
+        db 1, 2                 ; version 1.2
         dw 0                    ; flags
 %ifdef PDR_DISK
         db 'WINDSKPD'           ; name

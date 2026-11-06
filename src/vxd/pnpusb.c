@@ -112,7 +112,7 @@ const char *pkg_desc(u32 bdf)
     }
 }
 
-static struct pnode *node_by_usbid(u16 id)
+struct pnode *pnp_node_by_usbid(u16 id)
 {
     int i;
     for (i = 0; i < pnp_nnodes; i++)
@@ -178,6 +178,21 @@ static void instance_of(struct winusbnode *t, int n, struct winusbnode *d, char 
     }
 }
 
+int plat_pnp_known(u32 bdf);            /* platvxd.c */
+
+/* the devnode of a started WINUSB USB host controller (the enumerator of its devices) */
+static struct pnode *any_hc_node(void)
+{
+    int i;
+    for (i = 0; i < pnp_nnodes; i++)
+        if (pnp_nodes[i].dn && pnp_nodes[i].kind == PK_PCI && pnp_nodes[i].started == 2) {
+            u32 b = pnp_nodes[i].bdf;
+            if ((pci_rd32((int)(b >> 8), (int)((b >> 3) & 0x1F), (int)(b & 7), 8) >> 16) == 0x0C03)
+                return &pnp_nodes[i];
+        }
+    return NULL;
+}
+
 static void create_child(struct winusbnode *t, int n, struct winusbnode *d)
 {
     if (d->driver == UD_WDM) return;    /* a devnode of WINUSBW.SYS (the WDM bridge) */
@@ -195,6 +210,12 @@ static void create_node(struct winusbnode *t, int n, struct winusbnode *d)
     if (cur) {
         struct winusbnode *hc = tree_find(t, n, cur->parent);
         if (hc) parent = pnp_node_by_bdf(hc->pciloc);
+    }
+    if (!parent && cur) {
+        /* a controller Windows never enumerated (an ExpressCard plugged in after the start):
+           its devices go under the devnode of another WINUSB controller */
+        struct winusbnode *hc = tree_find(t, n, cur->parent);
+        if (hc && !plat_pnp_known(hc->pciloc)) parent = any_hc_node();
     }
     if (!parent) return;                /* parent devnode not there yet: next scan */
     instance_of(t, n, d, inst, sizeof(inst));
@@ -229,8 +250,20 @@ static void sync_nvme(void)
 /* The PS/2 mouse devnode with Windows' own driver (VMOUSE with MSMOUSE.VXD) gets the WINMOU.INF
    driver: WINUSB.VXD is its device loader from the next start on. Installing WINUSB makes
    WINMOUSE.DRV the mouse driver, after which Windows starts VMOUSE without MSMOUSE.VXD and
-   shows the PS/2 mouse with code 8. Not with /NOPS2, and only once per start. */
+   shows the PS/2 mouse with code 8. Not with /NOPS2, and only once per start.
+   Windows' values are kept in the software key (WinusbOld*) and in SYSTEM\WINUSBPS.REG for
+   UNINUSB: in a DOS box it asks the VxD to put them back (V86 API function 3, pnp_ps2_restore),
+   in MS-DOS mode it imports the file with the real-mode REGEDIT. */
 static const char mou_desc[] = "WINUSB PS/2 Mouse (IntelliMouse Explorer, 5 buttons)";
+static const char mou_loader[] = "WINUSB.VXD";
+
+/* Windows' own values and what stands in for them when they were not kept (Windows 98) */
+static const char *const mou_keys[] = { "DevLoader", "DriverDesc", "InfPath", "InfSection" };
+static const char *const mou_defs[] = { "*vmouse", "Standard PS/2 Port Mouse", "MSMOUSE.INF", "StdPS2" };
+#define MOU_NKEYS 4
+
+static u32 ps2_dns[4];          /* the adopted PS/2 mouse devnodes of this start */
+static int ps2_n;
 
 static int same_nocase(const char *a, const char *b)
 {
@@ -239,35 +272,67 @@ static int same_nocase(const char *a, const char *b)
     return !*a && !*b;
 }
 
-static void ps2_adopt_node(u32 dn)
+static int reg_get(u32 dn, const char *name, char *buf, u32 max, u32 where)
 {
-    static const char loader[] = "WINUSB.VXD";
-    static const char drvdesc[] = "WINDRV WINUSB 1.1 PS/2 mouse";
-    char buf[64];
-    u32 len = sizeof(buf) - 1;
-    memset(buf, 0, sizeof(buf));
-    if (cm_read_registry_value(dn, NULL, "DevLoader", REG_SZ, buf, &len, CM_REGISTRY_SOFTWARE) != CR_SUCCESS)
-        return;                         /* no driver installed: Windows offers WINMOU.INF itself */
-    if (same_nocase(buf, loader)) return;
-    cm_write_registry_value(dn, NULL, "DevLoader", REG_SZ, loader, sizeof(loader), CM_REGISTRY_SOFTWARE);
-    cm_write_registry_value(dn, NULL, "DriverDesc", REG_SZ, drvdesc, sizeof(drvdesc), CM_REGISTRY_SOFTWARE);
-    cm_write_registry_value(dn, NULL, "InfPath", REG_SZ, "WINMOU.INF", 11, CM_REGISTRY_SOFTWARE);
-    cm_write_registry_value(dn, NULL, "InfSection", REG_SZ, "WINMOU.PS2", 11, CM_REGISTRY_SOFTWARE);
-    cm_write_registry_value(dn, NULL, "Options", REG_SZ, "", 1, CM_REGISTRY_SOFTWARE);
-    pnp_set_desc(dn, mou_desc);
-    kprintf("pnp: PS/2 mouse devnode %08lx: device loader %s -> %s\n", dn, buf, loader);
+    u32 len = max - 1;
+    memset(buf, 0, max);
+    return cm_read_registry_value(dn, NULL, name, REG_SZ, buf, &len, where) == CR_SUCCESS;
 }
 
-static void ps2_adopt_tree(u32 dn, int depth)
+static void reg_put(u32 dn, const char *name, const char *v, u32 where)
+{
+    cm_write_registry_value(dn, NULL, name, REG_SZ, v, (u32)strlen(v) + 1, where);
+}
+
+/* Windows' value i of the devnode: the one kept, else the default */
+static void mou_old(u32 dn, int i, char *buf, u32 max)
+{
+    char name[32];
+    ksnprintf(name, sizeof(name), "WinusbOld%s", mou_keys[i]);
+    if (!reg_get(dn, name, buf, max, CM_REGISTRY_SOFTWARE) || !buf[0]) strlcpy(buf, mou_defs[i], max);
+}
+
+static void mou_old_desc(u32 dn, char *buf, u32 max)
+{
+    if (!reg_get(dn, "WinusbOldDeviceDesc", buf, max, CM_REGISTRY_SOFTWARE) || !buf[0])
+        strlcpy(buf, mou_defs[1], max);
+}
+
+static void ps2_adopt_node(u32 dn)
+{
+    static const char drvdesc[] = "WINDRV WINUSB 1.2 PS/2 mouse";
+    char buf[64], v[128], name[32];
+    int i;
+    if (!reg_get(dn, "DevLoader", buf, sizeof(buf), CM_REGISTRY_SOFTWARE))
+        return;                         /* no driver installed: Windows offers WINMOU.INF itself */
+    if (ps2_n < 4) ps2_dns[ps2_n++] = dn;
+    if (same_nocase(buf, mou_loader)) return;
+    for (i = 0; i < MOU_NKEYS; i++) {
+        ksnprintf(name, sizeof(name), "WinusbOld%s", mou_keys[i]);
+        if (reg_get(dn, mou_keys[i], v, sizeof(v), CM_REGISTRY_SOFTWARE) && v[0])
+            reg_put(dn, name, v, CM_REGISTRY_SOFTWARE);
+    }
+    if (reg_get(dn, "DeviceDesc", v, sizeof(v), CM_REGISTRY_HARDWARE) && v[0])
+        reg_put(dn, "WinusbOldDeviceDesc", v, CM_REGISTRY_SOFTWARE);
+    reg_put(dn, "DevLoader", mou_loader, CM_REGISTRY_SOFTWARE);
+    reg_put(dn, "DriverDesc", drvdesc, CM_REGISTRY_SOFTWARE);
+    reg_put(dn, "InfPath", "WINMOU.INF", CM_REGISTRY_SOFTWARE);
+    reg_put(dn, "InfSection", "WINMOU.PS2", CM_REGISTRY_SOFTWARE);
+    reg_put(dn, "Options", "", CM_REGISTRY_SOFTWARE);
+    pnp_set_desc(dn, mou_desc);
+    kprintf("pnp: PS/2 mouse devnode %08lx: device loader %s -> %s\n", dn, buf, mou_loader);
+}
+
+static void ps2_adopt_tree(u32 dn, int depth, void (*fn)(u32))
 {
     char id[128];
     u32 c;
     if (depth > 12) return;
     memset(id, 0, sizeof(id));
-    if (cm_get_device_id(dn, id, sizeof(id) - 1, 0) == CR_SUCCESS && input_kind(id) == 'M') ps2_adopt_node(dn);
+    if (cm_get_device_id(dn, id, sizeof(id) - 1, 0) == CR_SUCCESS && input_kind(id) == 'M') fn(dn);
     if (cm_get_child(&c, dn, 0) != CR_SUCCESS) return;
     do {
-        ps2_adopt_tree(c, depth + 1);
+        ps2_adopt_tree(c, depth + 1, fn);
     } while (cm_get_sibling(&c, c, 0) == CR_SUCCESS);
 }
 
@@ -278,7 +343,101 @@ static void ps2_adopt(void)
     if (done) return;
     done = 1;
     if (cb && (cb->opts2 & OPT2_NOPS2)) return;
-    if (cm_locate_devnode(&root, NULL, 0) == CR_SUCCESS) ps2_adopt_tree(root, 0);
+    if (cm_locate_devnode(&root, NULL, 0) == CR_SUCCESS) ps2_adopt_tree(root, 0, ps2_adopt_node);
+}
+
+/* a .REG string: \ and " escaped */
+static void reg_esc(char *out, u32 max, const char *s)
+{
+    u32 n = 0;
+    for (; *s && n + 3 < max; s++) {
+        if (*s == '\\' || *s == '"') out[n++] = '\\';
+        out[n++] = *s;
+    }
+    out[n] = 0;
+}
+
+/* SYSTEM\WINUSBPS.REG with Windows' values of the adopted PS/2 mouse devnodes: once, when
+   WINMOUSE.DRV starts (the file system is not ready for ring 0 file I/O earlier in the start
+   of Windows) */
+void pnp_ps2_regfile(void)
+{
+    static char text[2048];
+    char path[160], v[128], e[260], key[64], id[128];
+    const char *ep;
+    u32 dl = 0, err, h;
+    int k, i;
+    static int done;
+    if (done || !ps2_n) return;
+    done = 1;
+    strlcpy(text, "REGEDIT4\r\n", sizeof(text));
+    for (k = 0; k < ps2_n; k++) {
+        u32 dn = ps2_dns[k];
+        memset(id, 0, sizeof(id));
+        if (!reg_get(dn, "Driver", key, sizeof(key), CM_REGISTRY_HARDWARE) || !key[0] ||
+            cm_get_device_id(dn, id, sizeof(id) - 1, 0) != CR_SUCCESS)
+            continue;
+        /* key names as they are, value strings escaped */
+        strlcat(text, "\r\n[HKEY_LOCAL_MACHINE\\System\\CurrentControlSet\\Services\\Class\\", sizeof(text));
+        strlcat(text, key, sizeof(text));
+        strlcat(text, "]\r\n", sizeof(text));
+        for (i = 0; i < MOU_NKEYS; i++) {
+            mou_old(dn, i, v, sizeof(v));
+            reg_esc(e, sizeof(e), v);
+            strlcat(text, "\"", sizeof(text));
+            strlcat(text, mou_keys[i], sizeof(text));
+            strlcat(text, "\"=\"", sizeof(text));
+            strlcat(text, e, sizeof(text));
+            strlcat(text, "\"\r\n", sizeof(text));
+        }
+        strlcat(text, "\r\n[HKEY_LOCAL_MACHINE\\Enum\\", sizeof(text));
+        strlcat(text, id, sizeof(text));
+        strlcat(text, "]\r\n\"DeviceDesc\"=\"", sizeof(text));
+        mou_old_desc(dn, v, sizeof(v));
+        reg_esc(e, sizeof(e), v);
+        strlcat(text, e, sizeof(text));
+        strlcat(text, "\"\r\n", sizeof(text));
+    }
+    ep = vmm_exec_path(&dl);
+    if (!ep || !dl || dl > 120) return;
+    memcpy(path, ep, dl);
+    path[dl] = 0;
+    strlcat(path, "WINUSBPS.REG", sizeof(path));
+    /* create or replace, read / write, deny write */
+    h = ifs_r0io(0xD500, 0x0022, 0, 0x12, path, &err);
+    if (err) {
+        kprintf("pnp: cannot write %s\n", path);
+        return;
+    }
+    ifs_r0io(0xD601, h, (u32)strlen(text), 0, text, &err);
+    ifs_r0io(0xD700, h, 0, 0, NULL, &err);
+    kprintf("pnp: %s written\n", path);
+}
+
+/* UNINUSB in a DOS box: Windows' values back on the PS/2 mouse devnodes WINUSB took */
+static int ps2_restored;
+
+static void ps2_restore_node(u32 dn)
+{
+    char buf[64], v[128];
+    int i;
+    if (!reg_get(dn, "DevLoader", buf, sizeof(buf), CM_REGISTRY_SOFTWARE) || !same_nocase(buf, mou_loader)) return;
+    for (i = 0; i < MOU_NKEYS; i++) {
+        mou_old(dn, i, v, sizeof(v));
+        reg_put(dn, mou_keys[i], v, CM_REGISTRY_SOFTWARE);
+    }
+    mou_old_desc(dn, v, sizeof(v));
+    reg_put(dn, "DeviceDesc", v, CM_REGISTRY_HARDWARE);
+    ps2_restored++;
+    kprintf("pnp: PS/2 mouse devnode %08lx: Windows' driver restored\n", dn);
+}
+
+int pnp_ps2_restore(void)
+{
+    u32 root;
+    ps2_restored = 0;
+    if (cm_locate_devnode(&root, NULL, 0) == CR_SUCCESS) ps2_adopt_tree(root, 0, ps2_restore_node);
+    return ps2_restored;
 }
 
 /* the devnode of the WDM bus driver WINUSBW.SYS (Windows 98 / ME), under the first USB
@@ -361,7 +520,7 @@ void pkg_sync(void)
     for (i = 0; i < n; i++) {
         struct pnode *p;
         if (t[i].type != UN_DEV) continue;
-        p = node_by_usbid(t[i].id);
+        p = pnp_node_by_usbid(t[i].id);
         if (p) {
             p->seen = 1;
             continue;

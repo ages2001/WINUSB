@@ -41,8 +41,10 @@ void irq_restore(u32 f);
 #pragma aux irq_restore = "push eax" "popfd" parm [eax] modify exact [];
 void cpu_pause(void);
 #pragma aux cpu_pause = "db 0F3h, 90h" modify exact [];
-u32 cpu_features(void);         /* CPUID 1 EDX (0 without CPUID leaf 1) */
-#pragma aux cpu_features = "xor eax,eax" "cpuid" "test eax,eax" "jz n" "mov eax,1" "cpuid" "mov eax,edx" "jmp x" \
+u32 cpu_features(void);         /* CPUID 1 EDX (0 without CPUID or leaf 1: Vortex86 DX ...) */
+#pragma aux cpu_features = "pushfd" "pop eax" "mov ecx,eax" "xor eax,200000h" "push eax" "popfd" "pushfd" "pop eax" \
+    "push ecx" "popfd" "xor eax,ecx" "test eax,200000h" "jz n" \
+    "xor eax,eax" "cpuid" "test eax,eax" "jz n" "mov eax,1" "cpuid" "mov eax,edx" "jmp x" \
     "n: xor eax,eax" "x:" value [eax] modify exact [eax ebx ecx edx];
 u32 cpu_rdmsr(u32 msr);          /* low dword of a model specific register */
 #pragma aux cpu_rdmsr = "db 0Fh, 32h" parm [ecx] value [eax] modify exact [eax edx];
@@ -60,6 +62,9 @@ void cpu_clflush(void *p);
 
 /* ---- platform services (platdos.c / platvxd.c) ---- */
 void plat_putc(char c);
+void mouse_speed(int *dx, int *dy);     /* WINUSB /SPEED:n on the relative motion of a pointing device */
+void plat_vol_saved(const void *recs, u32 len);   /* the saved mixer settings changed (winvolrec array) */
+void plat_mspeed_saved(u32 pct);                    /* the pointer speed was set (WINF_SETOPT 5) */
 void plat_screen(int on);
 void plat_mouse_abs(int x, int y, int dz, int dw, int buttons);   /* x, y 0..65535 */
 void plat_irq_detach(int irq);  /* stop using an IRQ (masked again) */       /* DOS: log to the text screen too */

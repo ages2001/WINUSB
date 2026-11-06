@@ -1069,6 +1069,15 @@ int usb_api(struct winapireq *r, u8 *buf)
     }
     case WINF_SETOPT:
         if (r->arg0 == 4) dbg_level = r->arg1;
+        if (r->arg0 == 5) {
+            /* pointer speed of the mice and touchpads, percent (USBTREE, WINWHEEL) */
+            struct windos *w = (struct windos *)((u8 *)cb + WIN_DOSOFF);
+            if (r->arg1 != 0xFFFFFFFFUL) {
+                w->mspeed = (u8)(MIN(MAX(r->arg1, 25), 400) / 2);
+                plat_mspeed_saved((u32)w->mspeed * 2);
+            }
+            r->retlen = w->mspeed ? (u32)w->mspeed * 2 : 100;
+        }
         return WINE_OK;
     }
     return WINE_BADFN;
